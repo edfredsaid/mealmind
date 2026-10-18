@@ -81,6 +81,12 @@ async def async_print_today_card(
 
     lines.append("================================")
 
+    box_title = (
+        "TODAY'S MEAL CARD"
+        if dt == date.today()
+        else f"MEAL CARD: {dt.strftime('%a %d %b').upper()}"
+    )
+
     await hass.services.async_call(
         "escpos_printer",
         "print_box",
@@ -88,7 +94,7 @@ async def async_print_today_card(
             "align": "center",
             "padding": 1,
             "style": "ascii",
-            "text": "TODAY'S MEAL CARD",
+            "text": box_title,
             "cut": "none",
         },
         target={"entity_id": [printer_entity]},
@@ -107,6 +113,45 @@ async def async_print_today_card(
         target={"entity_id": [printer_entity]},
         blocking=True,
     )
+
+
+async def async_print_next_7_days_cards(
+    hass: HomeAssistant,
+    store: MealMindStore,
+    start_date_str: str | None = None,
+) -> int:
+    """Print an individual full Meal Card for every day with a meal planned in the next 7 days."""
+    schedule = store.get_schedule()
+    start_dt = date.fromisoformat(start_date_str) if start_date_str else date.today()
+
+    printed_count = 0
+    for i in range(7):
+        d = start_dt + timedelta(days=i)
+        d_str = d.isoformat()
+        day_entry = schedule.get(d_str, {})
+        if day_entry.get("skipped"):
+            continue
+        if day_entry.get("meal_id") or day_entry.get("meal_name"):
+            await async_print_today_card(hass, store, d_str)
+            printed_count += 1
+
+    if printed_count == 0:
+        settings = store.get_settings()
+        printer_entity = settings.get("printer_entity", "notify.hall_stairs_hallway_receipt_printer")
+        await hass.services.async_call(
+            "escpos_printer",
+            "print_text_utf8",
+            {
+                "align": "center",
+                "cut": "full",
+                "feed": 2,
+                "text": "MEALMIND\nNo meals planned in the next 7 days.",
+            },
+            target={"entity_id": [printer_entity]},
+            blocking=True,
+        )
+
+    return printed_count
 
 
 async def async_print_next_7_days(

@@ -22,6 +22,7 @@ from .const import DOMAIN, PLATFORMS, VERSION
 from .coordinator import MealMindCoordinator
 from .printer_helper import (
     async_print_next_7_days,
+    async_print_next_7_days_cards,
     async_print_shopping_list,
     async_print_today_card,
 )
@@ -97,6 +98,9 @@ def _async_register_services(
     async def handle_print_next_7_days(call: ServiceCall) -> None:
         await async_print_next_7_days(hass, store, call.data.get("start_date"))
 
+    async def handle_print_next_7_days_cards(call: ServiceCall) -> None:
+        await async_print_next_7_days_cards(hass, store, call.data.get("start_date"))
+
     async def handle_print_shopping_list(call: ServiceCall) -> None:
         await async_print_shopping_list(hass, store)
 
@@ -131,6 +135,12 @@ def _async_register_services(
         DOMAIN,
         "print_next_7_days",
         handle_print_next_7_days,
+        schema=vol.Schema({vol.Optional("start_date"): cv.string}),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "print_next_7_days_cards",
+        handle_print_next_7_days_cards,
         schema=vol.Schema({vol.Optional("start_date"): cv.string}),
     )
     hass.services.async_register(

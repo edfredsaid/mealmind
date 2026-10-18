@@ -1,13 +1,17 @@
 /**
- * MealMind v1.0.2 — Modern Web & Mobile App UI for Home Assistant
+ * MealMind v1.0.4 — Modern Web & Mobile App UI for Home Assistant
  *
- * Designed with:
- * - High-contrast WCAG AA/AAA dark slate & surface elevation palette (no theme contrast bleed)
- * - 44px–48px minimum touch targets across all buttons, rows, and controls
- * - Searchable, filterable Meal Picker Modal (replaces native <select> dropdowns)
- * - Top-level Hero Scanner & Segmented Sub-Views in Shop & Scan (no scrolling past long lists)
- * - Automatic Post-Scan Summary & Planned Meals Review Sheet after scanning a receipt
- * - Responsive Mobile Bottom Navigation Bar + Desktop Top Command Bar
+ * Key UX & Visual Hierarchy Refinements (v1.0.4):
+ * - HA Companion App & Mobile Sidebar Toggle (☰ dispatches 'hass-toggle-menu')
+ * - Semantic Colour Hierarchy:
+ *     • Emerald (#10b981) for primary creation/add/plan actions
+ *     • Violet (#8b5cf6) for AI & Smart actions (Auto-Schedule, Scan Receipt, AI Chef)
+ *     • Amber (#f59e0b) for schedule shifting (+1d Push) & expiry attention
+ *     • Sky (#0ea5e9) for active navigation & Today highlight
+ * - Reduced Information Density with ⋯ (3-Dot) Pop-Out Menus on Calendar & Database cards
+ * - Consolidated 🖨️ Print ▾ Popover Menu + New "Print Next 7 Days' Meal Cards (All Planned)"
+ * - Flattened Single-Layer Toolbar on the Shopping List view (no multi-layer sub-nav stacks)
+ * - Explicit Checkbox-Only Completion on Shopping List rows + Instant ↩️ Undo (Toast + Tray)
  */
 
 class MealMindPanel extends HTMLElement {
@@ -22,13 +26,20 @@ class MealMindPanel extends HTMLElement {
     this._isCompanion = params.get("companion") === "1";
     this._activeTab = this._isCompanion ? "shop" : "calendar";
 
-    // Shop sub-view on mobile/companion so nothing is buried under long lists:
-    // 'list' | 'meals' | 'scan'
-    this._shopSubView = "list";
-
-    // Food vs Non-Food Shopping List category switcher:
-    // 'food' | 'non_food' | 'both'
+    // Food vs Non-Food Shopping List category switcher: 'food' | 'non_food' | 'both'
     this._shopListCategory = "food";
+
+    // Recently completed shopping items for 1-tap Undo
+    // [{ summary, listType, time }]
+    this._recentlyCompleted = [];
+    this._showRecentlyCompleted = false;
+
+    // Pop-out menus & inline pickers (only one open at a time)
+    this._printMenuOpen = false;
+    this._shopMoreMenuOpen = false;
+    this._openCardMenuDate = null;
+    this._openExpiryDate = null;
+    this._openDbMenuId = null;
 
     // Calendar window state
     this._dayOffset = 0;
@@ -55,8 +66,7 @@ class MealMindPanel extends HTMLElement {
     };
 
     // Modals
-    // 1. Day / Meal Assignment Modal (with searchable database picker + custom editor)
-    // { date, mode: 'pick' | 'custom', search: '', favOnly: false, tagFilter: '', meal_id, meal_name, ingredients: [], newIngredient: '', shortest_expiry: '', pinned: false, notes: '', reviewIngredientsAfterSave: true }
+    // 1. Day / Meal Assignment Modal (searchable database picker + custom editor)
     this._dayModal = null;
 
     // 2. Database Create/Edit Meal Modal
@@ -65,11 +75,11 @@ class MealMindPanel extends HTMLElement {
     // 3. Mid-Step Ingredient Check Modal ("Untick what you already have in stock")
     this._ingredientReviewModal = null;
 
-    // 4. Post-Scan Results & Planned Meals Modal (opens immediately after receipt photo scan)
+    // 4. Post-Scan Results & Planned Meals Modal
     this._postScanModal = false;
 
-    // 5. Print Mission Quick Sheet
-    this._printMenuOpen = false;
+    // 5. Planned Meals & Expiry Unpack Modal (accessible in 1 click from Shop toolbar)
+    this._unpackModal = false;
 
     // Database tab filters
     this._dbSearch = "";
@@ -94,6 +104,22 @@ class MealMindPanel extends HTMLElement {
       this._initialized = true;
       this._fetchState();
     }
+  }
+
+  _closeAllMenus() {
+    this._printMenuOpen = false;
+    this._shopMoreMenuOpen = false;
+    this._openCardMenuDate = null;
+    this._openDbMenuId = null;
+  }
+
+  _toggleHaSidebar() {
+    this.dispatchEvent(
+      new CustomEvent("hass-toggle-menu", {
+        bubbles: true,
+        composed: true,
+      })
+    );
   }
 
   async _wsCall(payload) {
@@ -125,14 +151,17 @@ class MealMindPanel extends HTMLElement {
     this._render();
   }
 
-  _showToast(msg, isError = false) {
-    this._toast = { msg, isError };
+  _showToast(msg, isError = false, undoAction = null) {
+    this._toast = { msg, isError, undoAction };
     this._render();
     clearTimeout(this._toastTimer);
-    this._toastTimer = setTimeout(() => {
-      this._toast = null;
-      this._render();
-    }, 4200);
+    this._toastTimer = setTimeout(
+      () => {
+        this._toast = null;
+        this._render();
+      },
+      undoAction ? 6500 : 4200
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -183,6 +212,7 @@ class MealMindPanel extends HTMLElement {
       return {
         text: `⚠️ Exp ${shortFmt} (Overdue)`,
         cls: "badge-danger",
+        stripe: "stripe-danger",
       };
     }
     if (
@@ -193,11 +223,13 @@ class MealMindPanel extends HTMLElement {
       return {
         text: `⏳ Exp ${shortFmt} (Use Soon)`,
         cls: "badge-warn",
+        stripe: "stripe-warn",
       };
     }
     return {
       text: `📅 Exp ${shortFmt}`,
       cls: "badge-ok",
+      stripe: "stripe-ok",
     };
   }
 
@@ -259,7 +291,7 @@ class MealMindPanel extends HTMLElement {
       });
       this._updateLocalState(res);
       const count = (res.added_items || []).length;
-      this._showToast(`Added ${count} item(s) to your shopping list!`);
+      this._showToast(`Added ${count} item(s) to your Food shopping list!`);
     } catch (err) {
       this._showToast("Error adding items: " + (err.message || err), true);
     }
@@ -270,15 +302,24 @@ class MealMindPanel extends HTMLElement {
   // ---------------------------------------------------------------------------
 
   async _handlePrint(mission, dateStr = null) {
-    this._printMenuOpen = false;
+    this._closeAllMenus();
+    this._render();
     try {
       this._showToast("🖨️ Sending print job to receipt printer...");
-      await this._wsCall({
+      const res = await this._wsCall({
         type: "mealmind/printer/print",
         mission,
         date: dateStr,
       });
-      this._showToast("✅ Printed successfully!");
+      if (mission === "next_7_days_cards" && res && typeof res.printed_count === "number") {
+        this._showToast(
+          res.printed_count > 0
+            ? `✅ Printed ${res.printed_count} individual Meal Card(s)!`
+            : "ℹ️ No planned meals found in the next 7 days."
+        );
+      } else {
+        this._showToast("✅ Printed successfully!");
+      }
     } catch (err) {
       this._showToast("Printer error: " + (err.message || err), true);
     }
@@ -305,6 +346,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _handlePushDay(dateStr) {
+    this._closeAllMenus();
     try {
       const res = await this._wsCall({
         type: "mealmind/schedule/push_day",
@@ -324,6 +366,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _handleSkipDay(dateStr, reason = "Eating Out / Skip") {
+    this._closeAllMenus();
     try {
       const res = await this._wsCall({
         type: "mealmind/schedule/skip_day",
@@ -334,7 +377,9 @@ class MealMindPanel extends HTMLElement {
       this._updateLocalState(res);
       const skipped = res.action_result && res.action_result.skipped;
       this._showToast(
-        skipped ? `🚫 Marked ${this._formatDisplayDate(dateStr)} as skipped` : `↩️ Restored ${this._formatDisplayDate(dateStr)}`
+        skipped
+          ? `🚫 Marked ${this._formatDisplayDate(dateStr)} as skipped`
+          : `↩️ Restored ${this._formatDisplayDate(dateStr)}`
       );
     } catch (err) {
       this._showToast("Skip error: " + (err.message || err), true);
@@ -342,6 +387,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _handleTogglePin(dateStr) {
+    this._closeAllMenus();
     const entry = this._state.schedule[dateStr];
     if (!entry) return;
     try {
@@ -358,6 +404,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _handleClearDay(dateStr) {
+    this._closeAllMenus();
     try {
       const res = await this._wsCall({
         type: "mealmind/schedule/clear_day",
@@ -371,6 +418,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _handleSwapDays(dateA, dateB) {
+    this._closeAllMenus();
     if (!dateA || !dateB || dateA === dateB) return;
     try {
       const res = await this._wsCall({
@@ -380,7 +428,9 @@ class MealMindPanel extends HTMLElement {
       });
       this._swapSourceDate = null;
       this._updateLocalState(res);
-      this._showToast(`⇄ Swapped ${this._formatDisplayDate(dateA)} with ${this._formatDisplayDate(dateB)}`);
+      this._showToast(
+        `⇄ Swapped ${this._formatDisplayDate(dateA)} with ${this._formatDisplayDate(dateB)}`
+      );
     } catch (err) {
       this._showToast("Swap error: " + (err.message || err), true);
     }
@@ -393,6 +443,7 @@ class MealMindPanel extends HTMLElement {
         date: dateStr,
         shortest_expiry: newExpiry || "",
       });
+      this._openExpiryDate = null;
       this._updateLocalState(res);
       this._showToast(newExpiry ? `📅 Expiry set to ${newExpiry}` : "Cleared expiry date");
     } catch (err) {
@@ -405,6 +456,7 @@ class MealMindPanel extends HTMLElement {
   // ---------------------------------------------------------------------------
 
   _openDayModal(dateStr = null, forceMode = null) {
+    this._closeAllMenus();
     const targetDate = dateStr || this._findNextOpenDateStr();
     const existing = this._state.schedule[targetDate] || {};
     const mealId = existing.meal_id || "";
@@ -413,7 +465,6 @@ class MealMindPanel extends HTMLElement {
     const ingredients = [...(dbMeal.ingredients || [])];
     const hasMealsInDb = Object.keys(this._state.meals || {}).length > 0;
 
-    // Default to 'pick' when assigning an empty slot (if DB has meals), or 'custom' when editing an existing slot
     const initialMode =
       forceMode || (mealName ? "custom" : hasMealsInDb ? "pick" : "custom");
 
@@ -441,8 +492,6 @@ class MealMindPanel extends HTMLElement {
     this._dayModal.meal_name = meal.name;
     this._dayModal.ingredients = [...(meal.ingredients || [])];
     this._dayModal.notes = meal.notes || "";
-    // Switch to custom review step or save immediately?
-    // Giving a 1-tap "Assign Immediately" AND an "Edit Details / Expiry" option is super fast!
     this._dayModal.mode = "custom";
     this._render();
   }
@@ -513,6 +562,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _quickScheduleMeal(mealObj, targetDateStr = null, askShop = true) {
+    this._closeAllMenus();
     const dateStr = targetDateStr || this._findNextOpenDateStr();
     try {
       let mealId = mealObj.id || mealObj.meal_id || null;
@@ -556,6 +606,7 @@ class MealMindPanel extends HTMLElement {
   // ---------------------------------------------------------------------------
 
   _openMealModal(meal = null) {
+    this._closeAllMenus();
     if (meal) {
       this._mealModal = {
         id: meal.id,
@@ -621,6 +672,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _toggleMealFavourite(meal) {
+    this._closeAllMenus();
     try {
       const res = await this._wsCall({
         type: "mealmind/meals/save",
@@ -636,6 +688,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   async _deleteMeal(mealId) {
+    this._closeAllMenus();
     try {
       const res = await this._wsCall({
         type: "mealmind/meals/delete",
@@ -723,7 +776,6 @@ class MealMindPanel extends HTMLElement {
         ...(res.scan_result || {}),
         completed_summaries: res.completed_summaries || [],
       };
-      // Automatically open the Post-Scan Results & Planned Meals Review Sheet!
       this._postScanModal = true;
       this._updateLocalState(res);
       this._showToast(
@@ -736,19 +788,53 @@ class MealMindPanel extends HTMLElement {
   }
 
   // ---------------------------------------------------------------------------
-  // Shopping List Actions & Pop-Out Window
+  // Shopping List Actions (Explicit Checkbox + Undo) & Pop-Out Window
   // ---------------------------------------------------------------------------
 
-  async _completeShoppingItem(uidOrSummary, listType = "food") {
+  async _completeShoppingItem(uidOrSummary, summaryText, listType = "food") {
+    const cleanSummary = (summaryText || uidOrSummary || "").trim();
+    const lt = listType || "food";
     try {
       const res = await this._wsCall({
         type: "mealmind/shopping/complete_items",
         items: [uidOrSummary],
-        list_type: listType || "food",
+        list_type: lt,
       });
+      if (cleanSummary) {
+        this._recentlyCompleted = [
+          { summary: cleanSummary, listType: lt, id: Date.now() + Math.random() },
+          ...this._recentlyCompleted.filter(
+            (x) => !(x.summary.toLowerCase() === cleanSummary.toLowerCase() && x.listType === lt)
+          ),
+        ].slice(0, 15);
+      }
       this._updateLocalState(res);
+      this._showToast(`✓ Ticked off '${cleanSummary}'`, false, {
+        label: "↩️ Undo",
+        summary: cleanSummary,
+        listType: lt,
+      });
     } catch (err) {
       this._showToast("Failed to tick off item: " + (err.message || err), true);
+    }
+  }
+
+  async _undoCompletedShoppingItem(summaryText, listType = "food") {
+    if (!summaryText) return;
+    try {
+      this._recentlyCompleted = this._recentlyCompleted.filter(
+        (x) => !(x.summary.toLowerCase() === summaryText.toLowerCase() && x.listType === listType)
+      );
+      const res = await this._wsCall({
+        type: "mealmind/shopping/add_items",
+        items: [summaryText],
+        list_type: listType || "food",
+      });
+      this._toast = null;
+      this._updateLocalState(res);
+      this._showToast(`↩️ Restored '${summaryText}' back to your list`);
+    } catch (err) {
+      this._showToast("Failed to undo item: " + (err.message || err), true);
     }
   }
 
@@ -770,6 +856,7 @@ class MealMindPanel extends HTMLElement {
   }
 
   _openCompanionPopup() {
+    this._closeAllMenus();
     window.open(
       "/mealmind?companion=1",
       "MealMindOnlineShop",
@@ -798,17 +885,17 @@ class MealMindPanel extends HTMLElement {
           <div>
             <h3 class="section-title">📅 Planned Meals & Expiry Unpack</h3>
             <p class="section-subtitle">
-              Got inspiration in the store or unpacking your shop? Add/remove meals or tap to set shortest ingredient expiry dates.
+              Unpacking your shop? Set shortest ingredient expiry dates or add inspired meals.
             </p>
           </div>
           <div class="action-cluster">
-            <button class="btn btn-secondary quick-open-picker-btn">
-              📚 + Add Saved Meal
+            <button class="btn btn-emerald btn-sm quick-open-picker-btn">
+              ＋ Saved Meal
             </button>
-            <button class="btn btn-primary quick-open-custom-btn">
-              ✨ + New Inspired Meal
+            <button class="btn btn-secondary btn-sm quick-open-custom-btn">
+              ✍️ Custom Meal
             </button>
-            <button class="btn btn-accent quick-auto-schedule-btn">
+            <button class="btn btn-violet btn-sm quick-auto-schedule-btn">
               ⚡ Auto-Sort by Expiry
             </button>
           </div>
@@ -819,7 +906,6 @@ class MealMindPanel extends HTMLElement {
             ? `<div class="empty-state">
                 <div class="empty-icon">🍽️</div>
                 <div>No meals planned for the next 10 days yet.</div>
-                <div class="section-subtitle">Tap <strong>+ Add Saved Meal</strong> or <strong>+ New Inspired Meal</strong> above!</div>
               </div>`
             : `<div class="stack-list">
                 ${upcoming
@@ -866,13 +952,30 @@ class MealMindPanel extends HTMLElement {
       const isSkipped = Boolean(slot.skipped);
       const isPinned = Boolean(slot.pinned);
       const isFav = Boolean(dbMeal && dbMeal.favourite);
-      const ingredients = dbMeal ? dbMeal.ingredients || [] : [];
+      const ingredients =
+        slot.ingredients && slot.ingredients.length > 0
+          ? slot.ingredients
+          : dbMeal
+          ? dbMeal.ingredients || []
+          : [];
       const badge = this._getExpiryBadge(dStr, slot.shortest_expiry);
       const isSwapSelected = this._swapSourceDate === dStr;
       const isSwapTarget = Boolean(this._swapSourceDate && this._swapSourceDate !== dStr);
+      const isMenuOpen = this._openCardMenuDate === dStr;
+      const isExpiryOpen = this._openExpiryDate === dStr;
+
+      const stripeClass = isSkipped
+        ? ""
+        : mealName
+        ? badge
+          ? badge.stripe
+          : isPinned
+          ? "stripe-pin"
+          : "stripe-planned"
+        : "";
 
       daysHtml.push(`
-        <div class="day-card ${dStr === today ? "day-today" : ""} ${isSkipped ? "day-skipped" : ""} ${isSwapSelected ? "day-swap-source" : ""} ${isSwapTarget ? "day-swap-target" : ""}"
+        <div class="day-card ${dStr === today ? "day-today" : ""} ${!mealName && !isSkipped ? "day-unplanned" : ""} ${isSkipped ? "day-skipped" : ""} ${stripeClass} ${isSwapSelected ? "day-swap-source" : ""} ${isSwapTarget ? "day-swap-target" : ""}"
              draggable="true"
              data-date="${dStr}">
           <div class="day-card-top">
@@ -880,47 +983,90 @@ class MealMindPanel extends HTMLElement {
               <span class="day-date-label ${dStr === today ? "today-highlight" : ""}">
                 ${this._escapeHtml(this._formatDisplayDate(dStr))}
               </span>
-              <div class="badge-row">
-                ${isPinned ? `<span class="badge badge-pin">📌 Pinned</span>` : ""}
-                ${badge && !isSkipped ? `<span class="badge ${badge.cls}">${this._escapeHtml(badge.text)}</span>` : ""}
+              ${isPinned ? `<span class="badge badge-pin" title="Pinned to this day">📌</span>` : ""}
+              ${
+                mealName && !isSkipped
+                  ? badge
+                    ? `<button class="badge-interactive ${badge.cls} toggle-exp-popover-btn" data-date="${dStr}" title="Tap to change shortest ingredient expiry date">
+                        ${this._escapeHtml(badge.text)} ▾
+                      </button>`
+                    : `<button class="badge-interactive badge-subtle toggle-exp-popover-btn" data-date="${dStr}" title="Tap to set shortest ingredient expiry date">
+                        📅 Set Expiry
+                      </button>`
+                  : ""
+              }
+            </div>
+
+            <div class="card-top-right">
+              ${
+                isSwapTarget
+                  ? `<button class="btn btn-violet btn-xs swap-target-btn" data-date="${dStr}">⇄ Swap Here</button>`
+                  : ""
+              }
+              <div class="menu-anchor">
+                <button class="kebab-btn card-menu-toggle-btn" data-date="${dStr}" title="More options">⋯</button>
+                ${
+                  isMenuOpen
+                    ? `
+                      <div class="pop-menu">
+                        ${
+                          mealName && !isSkipped
+                            ? `
+                              <button class="pop-menu-item edit-day-btn" data-date="${dStr}">
+                                <span>✎</span> Change / Edit Meal
+                              </button>
+                              <button class="pop-menu-item toggle-exp-popover-btn" data-date="${dStr}">
+                                <span>📅</span> Set Expiry Date
+                              </button>
+                              <button class="pop-menu-item swap-start-btn" data-date="${dStr}">
+                                <span>⇄</span> ${isSwapSelected ? "Cancel Swap" : "Swap with Another Day"}
+                              </button>
+                              <button class="pop-menu-item pin-day-btn" data-date="${dStr}">
+                                <span>📌</span> ${isPinned ? "Unpin Meal" : "Pin Meal to This Day"}
+                              </button>
+                              <button class="pop-menu-item print-day-card-btn" data-date="${dStr}">
+                                <span>🖨️</span> Print This Day's Meal Card
+                              </button>
+                              <div class="pop-menu-divider"></div>
+                              <button class="pop-menu-item skip-day-btn" data-date="${dStr}">
+                                <span>🚫</span> Skip Day & Push Meal
+                              </button>
+                              <button class="pop-menu-item pop-menu-danger clear-day-btn" data-date="${dStr}">
+                                <span>🗑️</span> Clear Meal
+                              </button>
+                            `
+                            : isSkipped
+                            ? `
+                              <button class="pop-menu-item skip-day-btn" data-date="${dStr}">
+                                <span>↩️</span> Restore Day
+                              </button>
+                            `
+                            : `
+                              <button class="pop-menu-item edit-day-btn" data-date="${dStr}">
+                                <span>＋</span> Plan a Meal
+                              </button>
+                              <button class="pop-menu-item skip-day-btn" data-date="${dStr}">
+                                <span>🚫</span> Mark Day as Skipped / Eating Out
+                              </button>
+                            `
+                        }
+                      </div>
+                    `
+                    : ""
+                }
               </div>
             </div>
-            ${
-              isSwapTarget
-                ? `<button class="btn btn-accent btn-sm swap-target-btn" data-date="${dStr}">⇄ Swap Here</button>`
-                : ""
-            }
           </div>
 
-          <div class="day-card-content">
-            ${
-              isSkipped
-                ? `
-                  <div class="skipped-box">
-                    <span>🚫 ${this._escapeHtml(slot.skip_reason || "Skipped / Eating Out")}</span>
-                    <button class="btn btn-secondary btn-sm skip-day-btn" data-date="${dStr}">↩️ Restore Day</button>
+          ${
+            isExpiryOpen && mealName && !isSkipped
+              ? `
+                <div class="inline-expiry-drawer">
+                  <div class="expiry-drawer-header">
+                    <span>Shortest Ingredient Expiry:</span>
+                    <button class="chip-btn exp-clear-btn" data-date="${dStr}">Clear</button>
                   </div>
-                `
-                : mealName
-                ? `
-                  <div class="meal-headline edit-day-btn" data-date="${dStr}">
-                    <div class="meal-name-text">
-                      ${isFav ? `<span class="fav-star-inline">★</span>` : ""}
-                      ${this._escapeHtml(mealName)}
-                    </div>
-                    <span class="edit-affordance" title="Change or edit meal">✎ Change</span>
-                  </div>
-
-                  ${
-                    ingredients.length > 0
-                      ? `<div class="pill-row" style="margin-top: 8px;">
-                          ${ingredients.map((ing) => `<span class="pill">${this._escapeHtml(ing)}</span>`).join("")}
-                        </div>`
-                      : ""
-                  }
-
-                  <div class="day-expiry-bar">
-                    <span class="expiry-label">Shortest Date:</span>
+                  <div class="expiry-drawer-controls">
                     <div class="expiry-quick-pills">
                       <button class="chip-btn exp-shortcut-btn" data-date="${dStr}" data-days="1">+1d</button>
                       <button class="chip-btn exp-shortcut-btn" data-date="${dStr}" data-days="2">+2d</button>
@@ -928,40 +1074,59 @@ class MealMindPanel extends HTMLElement {
                     </div>
                     <input type="date" class="input input-date quick-exp-input" data-date="${dStr}" value="${slot.shortest_expiry || ""}" />
                   </div>
+                </div>
+              `
+              : ""
+          }
 
-                  <div class="day-action-bar">
-                    <button class="action-pill push-day-btn" data-date="${dStr}" title="Push meal +1 day">
-                      ⏭️ +1d
+          <div class="day-card-content">
+            ${
+              isSkipped
+                ? `
+                  <div class="skipped-box">
+                    <span>🚫 ${this._escapeHtml(slot.skip_reason || "Skipped / Eating Out")}</span>
+                    <button class="btn btn-secondary btn-xs skip-day-btn" data-date="${dStr}">↩️ Restore</button>
+                  </div>
+                `
+                : mealName
+                ? `
+                  <div class="meal-headline edit-day-btn" data-date="${dStr}" title="Tap to change or edit meal">
+                    <div class="meal-name-text">
+                      ${isFav ? `<span class="fav-star-inline">★</span>` : ""}
+                      ${this._escapeHtml(mealName)}
+                    </div>
+                  </div>
+
+                  ${
+                    ingredients.length > 0
+                      ? `<div class="pill-row" style="margin-top: 6px;">
+                          ${ingredients
+                            .slice(0, 5)
+                            .map((ing) => `<span class="pill">${this._escapeHtml(ing)}</span>`)
+                            .join("")}
+                          ${
+                            ingredients.length > 5
+                              ? `<span class="pill pill-muted">+${ingredients.length - 5} more</span>`
+                              : ""
+                          }
+                        </div>`
+                      : ""
+                  }
+
+                  <div class="day-card-footer">
+                    <button class="btn-chip btn-chip-amber push-day-btn" data-date="${dStr}" title="Push meal forward +1 day">
+                      ⏭️ Push +1d
                     </button>
-                    <button class="action-pill swap-start-btn ${isSwapSelected ? "active" : ""}" data-date="${dStr}" title="Swap with another day">
-                      ⇄ Swap
-                    </button>
-                    <button class="action-pill shop-day-btn" data-date="${dStr}" title="Check & add ingredients to shopping list">
-                      🛒 Shop
-                    </button>
-                    <button class="action-pill pin-day-btn ${isPinned ? "active" : ""}" data-date="${dStr}" title="${isPinned ? "Unpin" : "Pin to this date"}">
-                      📌 ${isPinned ? "Pinned" : "Pin"}
-                    </button>
-                    <button class="action-pill skip-day-btn" data-date="${dStr}" title="Skip day & push meal">
-                      🚫 Skip
-                    </button>
-                    <button class="action-pill action-pill-danger clear-day-btn" data-date="${dStr}" title="Clear meal">
-                      ✕
+                    <button class="btn-chip btn-chip-emerald shop-day-btn" data-date="${dStr}" title="Check & add ingredients to shopping list">
+                      🛒 Ingredients
                     </button>
                   </div>
                 `
                 : `
                   <div class="empty-day-slot">
                     <button class="btn-assign-meal edit-day-btn" data-date="${dStr}">
-                      <span style="font-size:18px;">＋</span> Choose or Add Meal
+                      <span>＋</span> Plan Meal
                     </button>
-                    <div style="display:flex; gap:6px;">
-                      ${
-                        !isSwapTarget
-                          ? `<button class="action-pill skip-day-btn" data-date="${dStr}" title="Mark day as Eating Out / Skip">🚫 Skip</button>`
-                          : ""
-                      }
-                    </div>
                   </div>
                 `
             }
@@ -978,7 +1143,7 @@ class MealMindPanel extends HTMLElement {
           ? `
             <div class="swap-banner">
               <div>
-                <strong>⇄ Swap Mode Active:</strong> Select any day card below to swap with <strong>${this._escapeHtml(this._formatDisplayDate(this._swapSourceDate))}</strong>
+                <strong>⇄ Swap Mode Active:</strong> Tap <strong>⇄ Swap Here</strong> on any day card to swap with <strong>${this._escapeHtml(this._formatDisplayDate(this._swapSourceDate))}</strong>
               </div>
               <button class="btn btn-secondary btn-sm" id="cancel-swap-btn">✕ Cancel Swap</button>
             </div>
@@ -988,16 +1153,16 @@ class MealMindPanel extends HTMLElement {
 
       <div class="command-bar">
         <div class="nav-cluster">
-          <button class="btn btn-secondary" id="cal-prev-week">◀ Prev 7d</button>
-          <button class="btn btn-secondary" id="cal-today">Today</button>
-          <button class="btn btn-secondary" id="cal-next-week">Next 7d ▶</button>
+          <button class="btn btn-secondary btn-sm" id="cal-prev-week">◀ Prev 7d</button>
+          <button class="btn btn-secondary btn-sm" id="cal-today">Today</button>
+          <button class="btn btn-secondary btn-sm" id="cal-next-week">Next 7d ▶</button>
           <span class="date-range-title">
             ${this._escapeHtml(this._formatDisplayDate(startStr))} – ${this._escapeHtml(this._formatDisplayDate(endStr))}
           </span>
         </div>
         <div class="action-cluster">
-          <button class="btn btn-accent" id="auto-schedule-btn">
-            ⚡ Auto-Schedule by Shortest Expiry
+          <button class="btn btn-violet" id="auto-schedule-btn">
+            ⚡ Auto-Sort by Expiry
           </button>
         </div>
       </div>
@@ -1009,7 +1174,7 @@ class MealMindPanel extends HTMLElement {
               <div class="section-header">
                 <div>
                   <h4 style="margin:0; font-size:15px;">🧺 Unscheduled Meal Queue (${queue.length})</h4>
-                  <p class="section-subtitle">Tap "Auto-Schedule by Shortest Expiry" to slot these into open days automatically.</p>
+                  <p class="section-subtitle">Tap "⚡ Auto-Sort by Expiry" to slot these into open days automatically.</p>
                 </div>
               </div>
               <div class="pill-row" style="margin-top:10px;">
@@ -1068,7 +1233,7 @@ class MealMindPanel extends HTMLElement {
             <input type="text" id="db-search-input" class="input input-search" placeholder="Search saved meals, ingredients, or tags..." value="${this._escapeHtml(this._dbSearch)}" />
           </div>
           <button class="filter-chip ${this._dbFavOnly ? "active" : ""}" id="db-fav-toggle">
-            ★ Favourites Only
+            ★ Favourites
           </button>
           ${Array.from(allTags)
             .sort()
@@ -1081,7 +1246,7 @@ class MealMindPanel extends HTMLElement {
             )
             .join("")}
         </div>
-        <button class="btn btn-primary" id="new-db-meal-btn">＋ New Meal</button>
+        <button class="btn btn-emerald" id="new-db-meal-btn">＋ New Saved Meal</button>
       </div>
 
       <div class="db-grid">
@@ -1090,11 +1255,12 @@ class MealMindPanel extends HTMLElement {
             ? `<div class="empty-state" style="grid-column: 1 / -1;">
                 <div class="empty-icon">🍲</div>
                 <div>No saved meals match your filter.</div>
-                <button class="btn btn-primary" id="empty-new-db-meal-btn" style="margin-top:10px;">＋ Add Your First Meal</button>
+                <button class="btn btn-emerald" id="empty-new-db-meal-btn" style="margin-top:10px;">＋ Add Your First Meal</button>
               </div>`
             : filtered
-                .map(
-                  (m) => `
+                .map((m) => {
+                  const isDbMenuOpen = this._openDbMenuId === m.id;
+                  return `
                   <div class="surface-card db-meal-card">
                     <div class="db-card-header">
                       <div style="display:flex; align-items:center; gap:8px;">
@@ -1103,9 +1269,29 @@ class MealMindPanel extends HTMLElement {
                         </button>
                         <h4 class="db-meal-title">${this._escapeHtml(m.name)}</h4>
                       </div>
-                      <div style="display:flex; gap:6px;">
-                        <button class="icon-btn db-edit-btn" data-id="${this._escapeHtml(m.id)}" title="Edit meal">✎</button>
-                        <button class="icon-btn icon-btn-danger db-del-btn" data-id="${this._escapeHtml(m.id)}" title="Delete meal">🗑️</button>
+                      <div class="menu-anchor">
+                        <button class="kebab-btn db-menu-toggle-btn" data-id="${this._escapeHtml(m.id)}" title="Meal options">⋯</button>
+                        ${
+                          isDbMenuOpen
+                            ? `
+                              <div class="pop-menu">
+                                <button class="pop-menu-item db-shop-btn" data-id="${this._escapeHtml(m.id)}">
+                                  <span>🛒</span> Check Ingredients for Shop
+                                </button>
+                                <button class="pop-menu-item db-edit-btn" data-id="${this._escapeHtml(m.id)}">
+                                  <span>✎</span> Edit Meal Details
+                                </button>
+                                <button class="pop-menu-item db-star-btn" data-id="${this._escapeHtml(m.id)}">
+                                  <span>★</span> ${m.favourite ? "Remove from Favourites" : "Mark as Favourite"}
+                                </button>
+                                <div class="pop-menu-divider"></div>
+                                <button class="pop-menu-item pop-menu-danger db-del-btn" data-id="${this._escapeHtml(m.id)}">
+                                  <span>🗑️</span> Delete Saved Meal
+                                </button>
+                              </div>
+                            `
+                            : ""
+                        }
                       </div>
                     </div>
 
@@ -1128,19 +1314,16 @@ class MealMindPanel extends HTMLElement {
                     ${m.notes ? `<div class="meal-notes">${this._escapeHtml(m.notes)}</div>` : ""}
 
                     <div class="db-card-actions">
-                      <button class="btn btn-primary btn-block db-plan-next-btn" data-id="${this._escapeHtml(m.id)}">
+                      <button class="btn btn-emerald btn-block db-plan-next-btn" data-id="${this._escapeHtml(m.id)}">
                         📅 Plan Next Open Day
                       </button>
                       <button class="btn btn-secondary db-pick-day-btn" data-id="${this._escapeHtml(m.id)}" title="Choose specific date">
                         📆 Pick Date
                       </button>
-                      <button class="btn btn-secondary db-shop-btn" data-id="${this._escapeHtml(m.id)}" title="Check & shop ingredients">
-                        🛒
-                      </button>
                     </div>
                   </div>
-                `
-                )
+                `;
+                })
                 .join("")
         }
       </div>
@@ -1163,7 +1346,7 @@ class MealMindPanel extends HTMLElement {
           <div class="badge-row">
             <span class="badge badge-ok">🥗 ${this._escapeHtml(s.dietary_profile || "Vegetarian")}</span>
             ${dislikesStr ? `<span class="badge badge-warn">🚫 No ${this._escapeHtml(dislikesStr)}</span>` : ""}
-            <span class="badge badge-pin">🛒 ${(this._state.shopping_list || []).length} items on list</span>
+            <span class="badge badge-pin">🛒 ${(this._state.shopping_list || []).length} food items</span>
           </div>
         </div>
 
@@ -1192,7 +1375,7 @@ class MealMindPanel extends HTMLElement {
           <input type="text" id="ai-extra-prompt" class="input" style="flex:1;"
                  placeholder="Any cravings or notes? (e.g. 'under 25 mins', 'cosy autumn dinner', 'use up mushrooms')..."
                  value="${this._escapeHtml(this._aiExtraPrompt)}" />
-          <button class="btn btn-accent btn-lg" id="run-ai-suggest-btn" ${this._aiLoading ? "disabled" : ""}>
+          <button class="btn btn-violet btn-lg" id="run-ai-suggest-btn" ${this._aiLoading ? "disabled" : ""}>
             ${this._aiLoading ? "⏳ Asking Gemini..." : "✨ Get Meal Ideas"}
           </button>
         </div>
@@ -1222,7 +1405,7 @@ class MealMindPanel extends HTMLElement {
                               ${(item.ingredients || []).map((i) => `<span class="pill">${this._escapeHtml(i)}</span>`).join("")}
                             </div>
                             <div class="db-card-actions">
-                              <button class="btn btn-primary btn-block ai-plan-db-btn" data-idx="${idx}">
+                              <button class="btn btn-emerald btn-block ai-plan-db-btn" data-idx="${idx}">
                                 📅 Plan & Check Ingredients
                               </button>
                             </div>
@@ -1248,7 +1431,7 @@ class MealMindPanel extends HTMLElement {
                         ${(item.ingredients || []).map((i) => `<span class="pill">${this._escapeHtml(i)}</span>`).join("")}
                       </div>
                       <div class="db-card-actions">
-                        <button class="btn btn-primary btn-block ai-plan-new-btn" data-idx="${idx}">
+                        <button class="btn btn-emerald btn-block ai-plan-new-btn" data-idx="${idx}">
                           📅 Plan & Save
                         </button>
                         <button class="btn btn-secondary ai-save-only-btn" data-idx="${idx}">
@@ -1269,12 +1452,18 @@ class MealMindPanel extends HTMLElement {
 
   _renderShoppingItemRow(item, listType = "food", showCategoryBadge = false) {
     const lt = item.list_type || listType || "food";
+    // IMPORTANT: Not wrapped in <label>! Only clicking the explicit .shop-check-btn completes the item.
     return `
       <div class="shop-item-row">
-        <label class="shop-item-label">
-          <input type="checkbox" class="modern-checkbox shop-check"
-                 data-uid="${this._escapeHtml(item.uid || item.summary)}"
-                 data-list-type="${this._escapeHtml(lt)}" />
+        <div class="shop-item-main">
+          <button type="button"
+                  class="shop-check-btn"
+                  data-uid="${this._escapeHtml(item.uid || item.summary)}"
+                  data-summary="${this._escapeHtml(item.summary)}"
+                  data-list-type="${this._escapeHtml(lt)}"
+                  title="Tick off item">
+            <span class="shop-check-circle">✓</span>
+          </button>
           <div class="shop-item-text">
             <div class="shop-item-name">
               ${this._escapeHtml(item.summary)}
@@ -1292,8 +1481,8 @@ class MealMindPanel extends HTMLElement {
                 : ""
             }
           </div>
-        </label>
-        <button class="icon-btn copy-shop-btn" data-text="${this._escapeHtml(item.summary)}" title="Copy item for online supermarket search">
+        </div>
+        <button class="icon-btn copy-shop-btn" data-text="${this._escapeHtml(item.summary)}" title="Copy item name for online supermarket search">
           📋
         </button>
       </div>
@@ -1313,206 +1502,193 @@ class MealMindPanel extends HTMLElement {
     }
 
     const cat = this._shopListCategory || "food";
-    const activeEntityLabel =
-      cat === "non_food"
-        ? this._state.settings.non_food_todo_entity || "todo.non_food_shopping"
-        : cat === "food"
-        ? this._state.settings.todo_entity || "todo.shopping_list"
-        : `${this._state.settings.todo_entity || "todo.shopping_list"} + ${this._state.settings.non_food_todo_entity || "todo.non_food_shopping"}`;
 
     return `
-      <!-- Top Action Hero Bar: Always visible at the very top of Shop & Scan (never buried under lists!) -->
-      <div class="shop-hero-bar">
-        <div class="shop-hero-actions">
-          <label class="btn btn-accent btn-lg upload-hero-btn">
+      <!-- Single Unified Shopping Toolbar: Category Pills on Left + Primary Actions & ⋯ on Right -->
+      <div class="shop-unified-toolbar">
+        <div class="shop-category-pills">
+          <button class="cat-pill cat-pill-food shop-cat-btn ${cat === "food" ? "active" : ""}" data-cat="food">
+            🍎 Food <span class="cat-count">${foodItems.length}</span>
+          </button>
+          <button class="cat-pill cat-pill-nf shop-cat-btn ${cat === "non_food" ? "active" : ""}" data-cat="non_food">
+            🧻 Non-Food <span class="cat-count">${nonFoodItems.length}</span>
+          </button>
+          <button class="cat-pill cat-pill-both shop-cat-btn ${cat === "both" ? "active" : ""}" data-cat="both">
+            📋 All <span class="cat-count">${totalShopCount}</span>
+          </button>
+        </div>
+
+        <div class="shop-toolbar-actions">
+          <label class="btn btn-violet upload-hero-btn" title="Take a photo of your marked paper list to auto-complete items">
             <input type="file" accept="image/*" capture="environment" id="receipt-file-input" style="display:none;" />
-            <span>${this._scanLoading ? "⏳ Scanning Receipt..." : "📷 Scan Marked Paper List"}</span>
+            <span>${this._scanLoading ? "⏳ Scanning..." : "📷 Scan List"}</span>
           </label>
 
-          <button class="btn btn-secondary" id="hero-add-saved-meal-btn">
-            📚 + Plan Saved Meal
+          <button class="btn btn-secondary" id="open-unpack-modal-btn" title="Set shortest expiry dates or plan meals while unpacking">
+            📅 Unpack / Expiry (${upcomingCount})
           </button>
-          <button class="btn btn-secondary" id="hero-add-custom-meal-btn">
-            ✨ + New Inspired Meal
-          </button>
-        </div>
 
-        <div class="shop-hero-Right">
-          ${
-            !this._isCompanion
-              ? `<button class="btn btn-secondary" id="popout-companion-btn" title="Open side-by-side companion window for online grocery shopping">
-                  🪟 Pop Out Companion
-                </button>`
-              : ""
-          }
-          <button class="btn btn-secondary" id="print-shop-btn" title="Prints both Food and Non-Food sections on your receipt printer">
-            🖨️ Print Paper List (Food & Non-Food)
-          </button>
-        </div>
-      </div>
-
-      <!-- Segmented Sub-View Switcher (especially fast on mobile so you never scroll past 40 items) -->
-      <div class="segmented-control">
-        <button class="seg-btn ${this._shopSubView === "list" ? "active" : ""}" data-subview="list">
-          🛒 Shopping Lists (${totalShopCount})
-        </button>
-        <button class="seg-btn ${this._shopSubView === "meals" ? "active" : ""}" data-subview="meals">
-          📅 Planned Meals & Expiry (${upcomingCount})
-        </button>
-        ${
-          this._scanSummary
-            ? `<button class="seg-btn ${this._shopSubView === "scan" ? "active" : ""}" data-subview="scan">
-                ✅ Last Receipt Scan (${(this._scanSummary.completed_summaries || []).length})
-              </button>`
-            : ""
-        }
-      </div>
-
-      <!-- Desktop 2-column split OR Mobile active sub-view -->
-      <div class="shop-workspace">
-        <div class="shop-col ${this._shopSubView === "list" ? "subview-active" : "subview-hidden-mobile"}">
-          <div class="surface-card">
-            <div class="section-header" style="margin-bottom: 12px;">
-              <div>
-                <h3 class="section-title">🛒 Shopping Lists</h3>
-                <p class="section-subtitle">Synced live with <code>${this._escapeHtml(activeEntityLabel)}</code></p>
-              </div>
-            </div>
-
-            <!-- Food vs Non-Food Category Switcher -->
-            <div class="segmented-control" style="margin-bottom: 14px;">
-              <button class="seg-btn shop-cat-btn ${cat === "food" ? "active" : ""}" data-cat="food">
-                🍎 Food & Groceries (${foodItems.length})
-              </button>
-              <button class="seg-btn shop-cat-btn ${cat === "non_food" ? "active" : ""}" data-cat="non_food">
-                🧻 Non-Food (${nonFoodItems.length})
-              </button>
-              <button class="seg-btn shop-cat-btn ${cat === "both" ? "active" : ""}" data-cat="both">
-                📋 Both (${totalShopCount})
-              </button>
-            </div>
-
-            <!-- Quick Add Bar -->
-            <div class="quick-input-bar" style="flex-wrap:wrap;">
-              <input type="text" id="quick-shop-item-input" class="input" style="flex:1; min-width:200px;"
-                     placeholder="${
-                       cat === "non_food"
-                         ? "Add non-food item (e.g. Toothpaste, Kitchen Roll, Bin Bags)..."
-                         : cat === "food"
-                         ? "Add food item (e.g. Oat Milk, Courgettes, Halloumi)..."
-                         : "Add item to Food or Non-Food list..."
-                     }" />
-              ${
-                cat === "both"
-                  ? `
-                    <button class="btn btn-primary" id="quick-shop-add-food-btn">＋ 🍎 Food</button>
-                    <button class="btn btn-secondary" id="quick-shop-add-nf-btn">＋ 🧻 Non-Food</button>
-                  `
-                  : `
-                    <button class="btn btn-primary" id="quick-shop-item-btn">
-                      ＋ Add to ${cat === "non_food" ? "Non-Food" : "Food"}
-                    </button>
-                  `
-              }
-            </div>
-
-            <!-- List Content -->
+          <div class="menu-anchor">
+            <button class="kebab-btn" id="shop-more-menu-btn" title="More shopping & meal actions">⋯</button>
             ${
-              cat === "food"
-                ? foodItems.length === 0
-                  ? `<div class="empty-state" style="margin-top:14px;">
-                      <div class="empty-icon">🍎</div>
-                      <div>Your Food & Groceries shopping list is clear!</div>
-                    </div>`
-                  : `<div class="shop-checklist" style="margin-top: 14px;">
-                      ${foodItems.map((item) => this._renderShoppingItemRow(item, "food", false)).join("")}
-                    </div>`
-                : cat === "non_food"
-                ? nonFoodItems.length === 0
-                  ? `<div class="empty-state" style="margin-top:14px;">
-                      <div class="empty-icon">🧻</div>
-                      <div>Your Non-Food & Household shopping list is clear!</div>
-                    </div>`
-                  : `<div class="shop-checklist" style="margin-top: 14px;">
-                      ${nonFoodItems.map((item) => this._renderShoppingItemRow(item, "non_food", false)).join("")}
-                    </div>`
-                : totalShopCount === 0
-                ? `<div class="empty-state" style="margin-top:14px;">
-                    <div class="empty-icon">🎉</div>
-                    <div>Both your Food and Non-Food shopping lists are completely clear!</div>
-                  </div>`
-                : `
-                  <div style="margin-top: 16px;">
-                    <div class="day-eyebrow" style="margin-bottom: 8px; color: #4ade80;">
-                      🍎 FOOD & GROCERIES (${foodItems.length})
-                    </div>
+              this._shopMoreMenuOpen
+                ? `
+                  <div class="pop-menu">
+                    <button class="pop-menu-item" id="print-shop-btn">
+                      <span>🖨️</span> Print Paper Shopping List
+                    </button>
+                    <button class="pop-menu-item" id="hero-add-saved-meal-btn">
+                      <span>📚</span> Plan a Saved Meal
+                    </button>
+                    <button class="pop-menu-item" id="hero-add-custom-meal-btn">
+                      <span>✨</span> Add New Inspired Meal
+                    </button>
                     ${
-                      foodItems.length === 0
-                        ? `<div class="section-subtitle" style="margin-bottom: 14px;">No food items needed.</div>`
-                        : `<div class="shop-checklist" style="margin-bottom: 18px;">
-                            ${foodItems.map((item) => this._renderShoppingItemRow(item, "food", false)).join("")}
-                          </div>`
+                      this._scanSummary
+                        ? `
+                          <button class="pop-menu-item" id="reopen-scan-modal-btn">
+                            <span>📸</span> View Last Receipt Scan Summary
+                          </button>
+                        `
+                        : ""
                     }
-
-                    <div class="day-eyebrow" style="margin-bottom: 8px; color: #fbbf24;">
-                      🧻 NON-FOOD & HOUSEHOLD (${nonFoodItems.length})
-                    </div>
                     ${
-                      nonFoodItems.length === 0
-                        ? `<div class="section-subtitle">No non-food items needed.</div>`
-                        : `<div class="shop-checklist">
-                            ${nonFoodItems.map((item) => this._renderShoppingItemRow(item, "non_food", false)).join("")}
-                          </div>`
+                      !this._isCompanion
+                        ? `
+                          <div class="pop-menu-divider"></div>
+                          <button class="pop-menu-item" id="popout-companion-btn">
+                            <span>🪟</span> Pop Out Companion Window
+                          </button>
+                        `
+                        : ""
                     }
                   </div>
                 `
+                : ""
             }
           </div>
         </div>
+      </div>
 
-        <div class="shop-col ${this._shopSubView === "meals" || this._shopSubView === "scan" ? "subview-active" : "subview-hidden-mobile"}">
+      <!-- Main Shopping Card -->
+      <div class="surface-card">
+        <!-- Quick Add Bar -->
+        <div class="quick-input-bar" style="flex-wrap:wrap; margin-bottom: 14px;">
+          <input type="text" id="quick-shop-item-input" class="input" style="flex:1; min-width:200px;"
+                 placeholder="${
+                   cat === "non_food"
+                     ? "Add non-food item (e.g. Toothpaste, Kitchen Roll, Bin Bags)..."
+                     : cat === "food"
+                     ? "Add food item (e.g. Oat Milk, Courgettes, Halloumi)..."
+                     : "Type an item to add to Food or Non-Food..."
+                 }" />
           ${
-            this._scanSummary
+            cat === "both"
               ? `
-                <div class="surface-card scan-summary-card" style="margin-bottom: 16px;">
-                  <div class="section-header">
-                    <div>
-                      <h3 class="section-title">📸 Latest Receipt Photo Scan</h3>
-                      <p class="section-subtitle">${this._escapeHtml(this._scanSummary.notes || "Synced with your Food & Non-Food To-Do lists")}</p>
-                    </div>
-                    <button class="btn btn-secondary btn-sm" id="reopen-scan-modal-btn">Expand</button>
-                  </div>
-                  <div style="margin-top: 10px;">
-                    <div class="day-eyebrow" style="color: #4ade80;">✅ Checked Off as Bought (${(this._scanSummary.completed_summaries || []).length})</div>
-                    <div class="pill-row" style="margin-top:6px;">
-                      ${
-                        (this._scanSummary.completed_summaries || []).length > 0
-                          ? this._scanSummary.completed_summaries
-                              .map((s) => `<span class="pill badge-ok">✓ ${this._escapeHtml(s)}</span>`)
-                              .join("")
-                          : `<span class="section-subtitle">None detected as crossed out or ticked</span>`
-                      }
-                    </div>
-                  </div>
-                  <div style="margin-top: 12px;">
-                    <div class="day-eyebrow" style="color: #fbbf24;">🛒 Unmarked / Still Needed (${(this._scanSummary.still_needed_items || []).length})</div>
-                    <div class="pill-row" style="margin-top:6px;">
-                      ${
-                        (this._scanSummary.still_needed_items || []).length > 0
-                          ? (this._scanSummary.still_needed_items || [])
-                              .map((i) => `<span class="pill">${this._escapeHtml(i.summary)}</span>`)
-                              .join("")
-                          : `<span class="section-subtitle">Everything on the list was picked up!</span>`
-                      }
-                    </div>
-                  </div>
-                </div>
+                <button class="btn btn-emerald" id="quick-shop-add-food-btn">＋ 🍎 Food</button>
+                <button class="btn btn-amber" id="quick-shop-add-nf-btn">＋ 🧻 Non-Food</button>
               `
+              : `
+                <button class="btn ${cat === "non_food" ? "btn-amber" : "btn-emerald"}" id="quick-shop-item-btn">
+                  ＋ Add ${cat === "non_food" ? "Non-Food" : "Food"}
+                </button>
+              `
+          }
+        </div>
+
+        <div class="shop-hint-row">
+          <span>Tap the circle <strong>✓</strong> on the left of an item to tick it off.</span>
+          ${
+            this._recentlyCompleted.length > 0
+              ? `<button class="undo-pill-btn" id="undo-latest-btn">
+                  ↩️ Undo '${this._escapeHtml(this._recentlyCompleted[0].summary)}'
+                </button>`
               : ""
           }
-
-          ${this._renderUpcomingMealsManager(false)}
         </div>
+
+        <!-- List Content -->
+        ${
+          cat === "food"
+            ? foodItems.length === 0
+              ? `<div class="empty-state" style="margin-top:10px;">
+                  <div class="empty-icon">🍎</div>
+                  <div>Your Food & Groceries shopping list is clear!</div>
+                </div>`
+              : `<div class="shop-checklist" style="margin-top: 10px;">
+                  ${foodItems.map((item) => this._renderShoppingItemRow(item, "food", false)).join("")}
+                </div>`
+            : cat === "non_food"
+            ? nonFoodItems.length === 0
+              ? `<div class="empty-state" style="margin-top:10px;">
+                  <div class="empty-icon">🧻</div>
+                  <div>Your Non-Food & Household shopping list is clear!</div>
+                </div>`
+              : `<div class="shop-checklist" style="margin-top: 10px;">
+                  ${nonFoodItems.map((item) => this._renderShoppingItemRow(item, "non_food", false)).join("")}
+                </div>`
+            : totalShopCount === 0
+            ? `<div class="empty-state" style="margin-top:10px;">
+                <div class="empty-icon">🎉</div>
+                <div>Both your Food and Non-Food shopping lists are completely clear!</div>
+              </div>`
+            : `
+              <div style="margin-top: 12px;">
+                <div class="day-eyebrow" style="margin-bottom: 8px; color: #4ade80;">
+                  🍎 FOOD & GROCERIES (${foodItems.length})
+                </div>
+                ${
+                  foodItems.length === 0
+                    ? `<div class="section-subtitle" style="margin-bottom: 14px;">No food items needed.</div>`
+                    : `<div class="shop-checklist" style="margin-bottom: 18px;">
+                        ${foodItems.map((item) => this._renderShoppingItemRow(item, "food", false)).join("")}
+                      </div>`
+                }
+
+                <div class="day-eyebrow" style="margin-bottom: 8px; color: #fbbf24;">
+                  🧻 NON-FOOD & HOUSEHOLD (${nonFoodItems.length})
+                </div>
+                ${
+                  nonFoodItems.length === 0
+                    ? `<div class="section-subtitle">No non-food items needed.</div>`
+                    : `<div class="shop-checklist">
+                        ${nonFoodItems.map((item) => this._renderShoppingItemRow(item, "non_food", false)).join("")}
+                      </div>`
+                }
+              </div>
+            `
+        }
+
+        ${
+          this._recentlyCompleted.length > 0
+            ? `
+              <div class="recently-completed-tray">
+                <button class="recently-completed-toggle" id="toggle-recent-completed-btn">
+                  <span>↩️ Recently Ticked Off (${this._recentlyCompleted.length}) — Tap to restore</span>
+                  <span>${this._showRecentlyCompleted ? "▴" : "▾"}</span>
+                </button>
+                ${
+                  this._showRecentlyCompleted
+                    ? `
+                      <div class="pill-row" style="margin-top: 10px;">
+                        ${this._recentlyCompleted
+                          .map(
+                            (rc) => `
+                            <button class="restore-chip-btn" data-summary="${this._escapeHtml(rc.summary)}" data-list-type="${this._escapeHtml(rc.listType)}">
+                              ↩️ ${this._escapeHtml(rc.summary)}
+                              <span style="opacity:0.7; font-size:11px;">(${rc.listType === "non_food" ? "🧻" : "🍎"})</span>
+                            </button>
+                          `
+                          )
+                          .join("")}
+                      </div>
+                    `
+                    : ""
+                }
+              </div>
+            `
+            : ""
+        }
       </div>
     `;
   }
@@ -1555,20 +1731,20 @@ class MealMindPanel extends HTMLElement {
           <input type="text" id="pref-printer" class="input" value="${this._escapeHtml(s.printer_entity || "notify.hall_stairs_hallway_receipt_printer")}" />
         </div>
         <div style="margin-top: 18px;">
-          <button class="btn btn-primary btn-lg" id="save-prefs-btn">💾 Save Preferences</button>
+          <button class="btn btn-emerald btn-lg" id="save-prefs-btn">💾 Save Preferences</button>
         </div>
       </div>
     `;
   }
 
   // ---------------------------------------------------------------------------
-  // Modals (Searchable Meal Picker, Custom Editor, Ingredient Check, Post-Scan)
+  // Modals (Searchable Meal Picker, Custom Editor, Ingredient Check, Post-Scan, Unpack)
   // ---------------------------------------------------------------------------
 
   _renderModals() {
     let html = "";
 
-    // 1. Searchable Day / Meal Assignment Modal (No native <select> dropdowns!)
+    // 1. Searchable Day / Meal Assignment Modal
     if (this._dayModal) {
       const m = this._dayModal;
       const meals = Object.values(this._state.meals || {});
@@ -1605,10 +1781,9 @@ class MealMindPanel extends HTMLElement {
               <button class="icon-btn" id="day-modal-cancel" title="Close">✕</button>
             </div>
 
-            <!-- Mode Switcher: Search Saved Database vs Custom / Edit Details -->
             <div class="segmented-control" style="margin: 12px 0 16px;">
               <button class="seg-btn ${m.mode === "pick" ? "active" : ""}" id="day-mode-pick-btn">
-                📚 Choose from Meal Database (${meals.length})
+                📚 Saved Meals (${meals.length})
               </button>
               <button class="seg-btn ${m.mode === "custom" ? "active" : ""}" id="day-mode-custom-btn">
                 ✍️ ${m.meal_name ? `Details & Expiry (${this._escapeHtml(m.meal_name)})` : "New / Custom Meal"}
@@ -1618,12 +1793,11 @@ class MealMindPanel extends HTMLElement {
             ${
               m.mode === "pick"
                 ? `
-                  <!-- Search & Filter Bar -->
                   <div class="picker-toolbar">
                     <div class="search-input-wrap" style="flex:1;">
                       <span class="search-icon">🔍</span>
                       <input type="text" id="picker-search-input" class="input input-search"
-                             placeholder="Type to search meals or ingredients..."
+                             placeholder="Search meals or ingredients..."
                              value="${this._escapeHtml(m.search || "")}" />
                     </div>
                     <button class="filter-chip ${m.favOnly ? "active" : ""}" id="picker-fav-btn">
@@ -1649,7 +1823,6 @@ class MealMindPanel extends HTMLElement {
                       : ""
                   }
 
-                  <!-- Optional Expiry & Shop Check bar right in the picker -->
                   <div class="picker-options-bar">
                     <label class="toggle-row" style="cursor:pointer;">
                       <input type="checkbox" class="modern-checkbox" id="day-modal-ask-shop" ${m.reviewIngredientsAfterSave ? "checked" : ""} />
@@ -1661,14 +1834,13 @@ class MealMindPanel extends HTMLElement {
                     </div>
                   </div>
 
-                  <!-- Tappable Meal Cards List -->
                   <div class="picker-results-list">
                     ${
                       filteredMeals.length === 0
                         ? `
                           <div class="empty-state">
                             <div>No matching saved meals found.</div>
-                            <button class="btn btn-primary" id="picker-create-new-btn" style="margin-top:10px;">
+                            <button class="btn btn-emerald" id="picker-create-new-btn" style="margin-top:10px;">
                               ✍️ Create "${this._escapeHtml(m.search || "New Meal")}"
                             </button>
                           </div>
@@ -1692,7 +1864,7 @@ class MealMindPanel extends HTMLElement {
                                   <button class="btn btn-secondary btn-sm picker-customize-btn" data-id="${this._escapeHtml(dbm.id)}" title="Customize ingredients or expiry before saving">
                                     ✎ Edit
                                   </button>
-                                  <button class="btn btn-primary picker-quick-assign" data-id="${this._escapeHtml(dbm.id)}">
+                                  <button class="btn btn-emerald picker-quick-assign" data-id="${this._escapeHtml(dbm.id)}">
                                     ✓ Choose
                                   </button>
                                 </div>
@@ -1704,7 +1876,6 @@ class MealMindPanel extends HTMLElement {
                   </div>
                 `
                 : `
-                  <!-- Custom / Edit Meal Details View -->
                   <div class="form-group">
                     <label>Meal Name</label>
                     <input type="text" id="day-modal-name" class="input" value="${this._escapeHtml(m.meal_name)}" placeholder="e.g. Crispy Halloumi Fajitas" />
@@ -1763,7 +1934,7 @@ class MealMindPanel extends HTMLElement {
 
                   <div class="modal-footer">
                     <button class="btn btn-secondary" id="day-modal-cancel-btn">Cancel</button>
-                    <button class="btn btn-primary btn-lg" id="day-modal-save">💾 Save Meal Plan</button>
+                    <button class="btn btn-emerald btn-lg" id="day-modal-save">💾 Save Meal Plan</button>
                   </div>
                 `
             }
@@ -1840,7 +2011,7 @@ class MealMindPanel extends HTMLElement {
 
             <div class="modal-footer">
               <button class="btn btn-secondary" id="meal-modal-cancel">Cancel</button>
-              <button class="btn btn-primary btn-lg" id="meal-modal-save">💾 Save to Database</button>
+              <button class="btn btn-emerald btn-lg" id="meal-modal-save">💾 Save to Database</button>
             </div>
           </div>
         </div>
@@ -1868,7 +2039,7 @@ class MealMindPanel extends HTMLElement {
                 .map(
                   (item, idx) => `
                   <label class="shop-item-row" style="cursor:pointer;">
-                    <div class="shop-item-label">
+                    <div class="shop-item-main">
                       <input type="checkbox" class="modern-checkbox ing-review-check" data-idx="${idx}" ${item.checked ? "checked" : ""} />
                       <span class="shop-item-name">${this._escapeHtml(item.name)}</span>
                     </div>
@@ -1890,14 +2061,14 @@ class MealMindPanel extends HTMLElement {
 
             <div class="modal-footer">
               <button class="btn btn-secondary" id="ing-review-skip">Skip (Have Everything)</button>
-              <button class="btn btn-primary btn-lg" id="ing-review-confirm">🛒 Add Checked to List</button>
+              <button class="btn btn-emerald btn-lg" id="ing-review-confirm">🛒 Add Checked to List</button>
             </div>
           </div>
         </div>
       `;
     }
 
-    // 4. Post-Scan Results & Planned Meals Review Modal (opens automatically right after scanning a receipt!)
+    // 4. Post-Scan Results & Planned Meals Review Modal
     if (this._postScanModal && this._scanSummary) {
       html += `
         <div class="modal-backdrop">
@@ -1940,11 +2111,33 @@ class MealMindPanel extends HTMLElement {
 
             <hr class="divider" />
 
-            <!-- Embedded Planned Meals & Expiry Unpack Manager right inside the post-scan sheet! -->
             ${this._renderUpcomingMealsManager(true)}
 
             <div class="modal-footer">
-              <button class="btn btn-primary btn-lg" id="done-post-scan-modal">Done</button>
+              <button class="btn btn-emerald btn-lg" id="done-post-scan-modal">Done</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // 5. Planned Meals & Expiry Unpack Modal (from Shopping toolbar)
+    if (this._unpackModal) {
+      html += `
+        <div class="modal-backdrop">
+          <div class="modal-sheet modal-sheet-lg">
+            <div class="modal-header">
+              <div>
+                <div class="day-eyebrow">UNPACKING & EXPIRY DATES</div>
+                <h3 class="modal-title">📅 Planned Meals (Next 10 Days)</h3>
+              </div>
+              <button class="icon-btn" id="close-unpack-modal">✕</button>
+            </div>
+            <div style="margin-top: 12px;">
+              ${this._renderUpcomingMealsManager(true)}
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-emerald" id="done-unpack-modal">Done</button>
             </div>
           </div>
         </div>
@@ -1973,22 +2166,28 @@ class MealMindPanel extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host {
-          /* Explicit High-Contrast Modern Slate Palette — immune to low-contrast HA theme overrides */
           --mm-bg: #0b0f19;
           --mm-surface: #151c2c;
           --mm-surface-elevated: #1e293b;
           --mm-surface-hover: #263349;
-          --mm-border: rgba(148, 163, 184, 0.18);
-          --mm-border-strong: rgba(148, 163, 184, 0.32);
+          --mm-border: rgba(148, 163, 184, 0.16);
+          --mm-border-strong: rgba(148, 163, 184, 0.3);
           --mm-text: #f8fafc;
           --mm-text-muted: #94a3b8;
-          --mm-primary: #0284c7;
-          --mm-primary-hover: #0369a1;
-          --mm-primary-text: #ffffff;
-          --mm-accent: #7c3aed;
-          --mm-accent-hover: #6d28d9;
-          --mm-success-bg: rgba(34, 197, 94, 0.18);
-          --mm-success-text: #4ade80;
+
+          /* Semantic Mission Colors */
+          --mm-sky: #0284c7;
+          --mm-sky-bright: #38bdf8;
+          --mm-emerald: #059669;
+          --mm-emerald-hover: #047857;
+          --mm-emerald-bright: #10b981;
+          --mm-violet: #7c3aed;
+          --mm-violet-hover: #6d28d9;
+          --mm-amber: #d97706;
+          --mm-amber-bright: #f59e0b;
+
+          --mm-success-bg: rgba(16, 185, 129, 0.18);
+          --mm-success-text: #34d399;
           --mm-warn-bg: rgba(245, 158, 11, 0.2);
           --mm-warn-text: #fbbf24;
           --mm-danger-bg: rgba(239, 68, 68, 0.2);
@@ -2000,7 +2199,7 @@ class MealMindPanel extends HTMLElement {
           color: var(--mm-text);
           min-height: 100vh;
           font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          padding: ${this._isCompanion ? "12px 12px 84px" : "20px 24px 96px"};
+          padding: ${this._isCompanion ? "12px 12px 84px" : "18px 22px 96px"};
           line-height: 1.45;
           -webkit-font-smoothing: antialiased;
         }
@@ -2013,28 +2212,44 @@ class MealMindPanel extends HTMLElement {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          flex-wrap: wrap;
           gap: 12px;
-          margin-bottom: 18px;
+          margin-bottom: 16px;
         }
         .brand-wrap {
           display: flex;
           align-items: center;
-          gap: 12px;
+          gap: 10px;
         }
-        .brand-logo {
+        .ha-menu-btn {
           width: 42px;
           height: 42px;
           border-radius: 12px;
-          background: linear-gradient(135deg, #0284c7, #7c3aed);
+          border: 1px solid var(--mm-border-strong);
+          background: var(--mm-surface-elevated);
+          color: var(--mm-text);
+          font-size: 20px;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          transition: background 0.15s;
+        }
+        .ha-menu-btn:hover {
+          background: var(--mm-surface-hover);
+        }
+        .brand-logo {
+          width: 40px;
+          height: 40px;
+          border-radius: 12px;
+          background: linear-gradient(135deg, #059669, #0284c7);
           display: flex;
           align-items: center;
           justify-content: center;
-          font-size: 22px;
-          box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
+          font-size: 20px;
+          box-shadow: 0 4px 12px rgba(5, 150, 105, 0.3);
         }
         .brand-title {
-          font-size: 22px;
+          font-size: 20px;
           font-weight: 800;
           letter-spacing: -0.02em;
           color: var(--mm-text);
@@ -2045,23 +2260,102 @@ class MealMindPanel extends HTMLElement {
           color: var(--mm-text-muted);
           margin: 0;
         }
-
-        /* Print Quick Cluster */
         .header-actions {
           display: flex;
+          align-items: center;
           gap: 8px;
-          flex-wrap: wrap;
+        }
+
+        /* Pop-out 3-Dot & Print Dropdown Menus */
+        .menu-anchor {
+          position: relative;
+          display: inline-flex;
+        }
+        .kebab-btn {
+          width: 38px;
+          height: 38px;
+          border-radius: 10px;
+          border: 1px solid var(--mm-border);
+          background: rgba(30, 41, 59, 0.75);
+          color: #cbd5e1;
+          font-size: 18px;
+          font-weight: 800;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          transition: all 0.15s;
+        }
+        .kebab-btn:hover {
+          background: var(--mm-surface-hover);
+          color: #ffffff;
+          border-color: var(--mm-border-strong);
+        }
+        .pop-menu {
+          position: absolute;
+          top: calc(100% + 6px);
+          right: 0;
+          min-width: 245px;
+          background: #1e293b;
+          border: 1px solid rgba(148, 163, 184, 0.35);
+          border-radius: 14px;
+          padding: 6px;
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.65);
+          z-index: 1200;
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+        .pop-menu-wide {
+          min-width: 290px;
+        }
+        .pop-menu-item {
+          width: 100%;
+          border: none;
+          background: transparent;
+          color: #f1f5f9;
+          padding: 10px 12px;
+          border-radius: 10px;
+          font-size: 13px;
+          font-weight: 600;
+          text-align: left;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          transition: background 0.12s;
+        }
+        .pop-menu-item:hover {
+          background: rgba(255, 255, 255, 0.08);
+        }
+        .pop-menu-item-sub {
+          display: block;
+          font-size: 11px;
+          font-weight: 500;
+          color: #94a3b8;
+          margin-top: 2px;
+        }
+        .pop-menu-danger {
+          color: #f87171;
+        }
+        .pop-menu-danger:hover {
+          background: rgba(239, 68, 68, 0.15);
+        }
+        .pop-menu-divider {
+          height: 1px;
+          background: var(--mm-border);
+          margin: 4px 6px;
         }
 
         /* Desktop Primary Navigation Tabs */
         .desktop-tabs {
           display: flex;
-          gap: 8px;
+          gap: 6px;
           background: var(--mm-surface);
-          padding: 6px;
+          padding: 5px;
           border-radius: 14px;
           border: 1px solid var(--mm-border);
-          margin-bottom: 20px;
+          margin-bottom: 18px;
           overflow-x: auto;
         }
         .tab-btn {
@@ -2069,8 +2363,8 @@ class MealMindPanel extends HTMLElement {
           color: var(--mm-text-muted);
           border: none;
           border-radius: 10px;
-          padding: 10px 16px;
-          min-height: 44px;
+          padding: 9px 16px;
+          min-height: 42px;
           font-size: 14px;
           font-weight: 700;
           cursor: pointer;
@@ -2085,9 +2379,9 @@ class MealMindPanel extends HTMLElement {
           background: rgba(255, 255, 255, 0.05);
         }
         .tab-btn.active {
-          background: var(--mm-primary);
+          background: var(--mm-sky);
           color: #ffffff;
-          box-shadow: 0 2px 10px rgba(2, 132, 199, 0.4);
+          box-shadow: 0 2px 10px rgba(2, 132, 199, 0.35);
         }
         .tab-count {
           background: rgba(0, 0, 0, 0.25);
@@ -2130,11 +2424,11 @@ class MealMindPanel extends HTMLElement {
           flex: 1;
         }
         .mob-nav-btn .mob-icon {
-          font-size: 19px;
+          font-size: 18px;
         }
         .mob-nav-btn.active {
           color: #ffffff;
-          background: var(--mm-primary);
+          background: var(--mm-sky);
         }
 
         /* Cards & Command Bars */
@@ -2142,21 +2436,21 @@ class MealMindPanel extends HTMLElement {
           background: var(--mm-surface);
           border: 1px solid var(--mm-border);
           border-radius: 16px;
-          padding: 18px;
+          padding: 16px;
           margin-bottom: 16px;
-          box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+          box-shadow: 0 4px 18px rgba(0, 0, 0, 0.2);
         }
         .command-bar {
           background: var(--mm-surface);
           border: 1px solid var(--mm-border);
-          border-radius: 16px;
-          padding: 12px 16px;
-          margin-bottom: 16px;
+          border-radius: 14px;
+          padding: 10px 14px;
+          margin-bottom: 14px;
           display: flex;
           justify-content: space-between;
           align-items: center;
           flex-wrap: wrap;
-          gap: 12px;
+          gap: 10px;
         }
         .nav-cluster, .action-cluster {
           display: flex;
@@ -2165,10 +2459,10 @@ class MealMindPanel extends HTMLElement {
           flex-wrap: wrap;
         }
         .date-range-title {
-          font-size: 15px;
+          font-size: 14px;
           font-weight: 700;
           color: var(--mm-text);
-          margin-left: 6px;
+          margin-left: 4px;
         }
         .section-header {
           display: flex;
@@ -2179,29 +2473,29 @@ class MealMindPanel extends HTMLElement {
         }
         .section-title {
           margin: 0;
-          font-size: 18px;
+          font-size: 17px;
           font-weight: 800;
           color: var(--mm-text);
         }
         .section-subtitle {
-          margin: 4px 0 0;
+          margin: 3px 0 0;
           font-size: 13px;
           color: var(--mm-text-muted);
         }
 
-        /* Buttons — 44px minimum touch target & crisp contrast */
+        /* Semantic Buttons */
         .btn {
           border: 1px solid transparent;
-          border-radius: 12px;
-          padding: 10px 16px;
-          min-height: 44px;
-          font-size: 14px;
+          border-radius: 11px;
+          padding: 9px 15px;
+          min-height: 42px;
+          font-size: 13.5px;
           font-weight: 700;
           cursor: pointer;
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          gap: 8px;
+          gap: 7px;
           transition: all 0.15s ease;
           text-decoration: none;
           color: var(--mm-text);
@@ -2209,52 +2503,103 @@ class MealMindPanel extends HTMLElement {
         .btn:active {
           transform: translateY(1px);
         }
-        .btn-primary {
-          background: var(--mm-primary);
+        .btn-emerald {
+          background: var(--mm-emerald);
           color: #ffffff;
+          box-shadow: 0 2px 10px rgba(5, 150, 105, 0.3);
         }
-        .btn-primary:hover {
-          background: var(--mm-primary-hover);
+        .btn-emerald:hover {
+          background: var(--mm-emerald-hover);
         }
-        .btn-accent {
-          background: linear-gradient(135deg, #7c3aed, #0284c7);
+        .btn-violet {
+          background: linear-gradient(135deg, #7c3aed, #6d28d9);
           color: #ffffff;
-          box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);
+          box-shadow: 0 3px 12px rgba(124, 58, 237, 0.35);
         }
-        .btn-accent:hover {
+        .btn-violet:hover {
           filter: brightness(1.08);
+        }
+        .btn-amber {
+          background: var(--mm-amber);
+          color: #ffffff;
+        }
+        .btn-amber:hover {
+          filter: brightness(1.08);
+        }
+        .btn-primary {
+          background: var(--mm-sky);
+          color: #ffffff;
         }
         .btn-secondary {
           background: var(--mm-surface-elevated);
-          color: var(--mm-text);
+          color: #e2e8f0;
           border-color: var(--mm-border-strong);
         }
         .btn-secondary:hover {
           background: var(--mm-surface-hover);
+          color: #ffffff;
         }
         .btn-lg {
-          min-height: 48px;
-          padding: 12px 20px;
-          font-size: 15px;
+          min-height: 46px;
+          padding: 11px 18px;
+          font-size: 14.5px;
         }
         .btn-sm {
-          min-height: 38px;
+          min-height: 36px;
           padding: 6px 12px;
-          font-size: 13px;
-          border-radius: 10px;
+          font-size: 12.5px;
+          border-radius: 9px;
+        }
+        .btn-xs {
+          min-height: 30px;
+          padding: 4px 10px;
+          font-size: 12px;
+          border-radius: 8px;
         }
         .btn-block {
           flex: 1;
         }
 
+        /* Colored Compact Card Action Chips */
+        .btn-chip {
+          border-radius: 9px;
+          padding: 6px 12px;
+          min-height: 34px;
+          font-size: 12.5px;
+          font-weight: 700;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          transition: all 0.15s;
+        }
+        .btn-chip-amber {
+          background: rgba(245, 158, 11, 0.14);
+          color: #fbbf24;
+          border: 1px solid rgba(245, 158, 11, 0.35);
+        }
+        .btn-chip-amber:hover {
+          background: rgba(245, 158, 11, 0.26);
+          color: #fef3c7;
+        }
+        .btn-chip-emerald {
+          background: rgba(16, 185, 129, 0.14);
+          color: #34d399;
+          border: 1px solid rgba(16, 185, 129, 0.35);
+        }
+        .btn-chip-emerald:hover {
+          background: rgba(16, 185, 129, 0.26);
+          color: #ecfdf5;
+        }
+
         .icon-btn {
-          width: 42px;
-          height: 42px;
+          width: 38px;
+          height: 38px;
           border-radius: 10px;
           border: 1px solid var(--mm-border);
           background: var(--mm-surface-elevated);
           color: var(--mm-text);
-          font-size: 16px;
+          font-size: 15px;
           cursor: pointer;
           display: inline-flex;
           align-items: center;
@@ -2267,97 +2612,158 @@ class MealMindPanel extends HTMLElement {
           color: var(--mm-danger-text);
           border-color: rgba(239, 68, 68, 0.3);
         }
-        .icon-btn-danger:hover {
-          background: var(--mm-danger-bg);
-        }
 
         /* Inputs */
         .input {
           background: #0f172a;
           color: #f8fafc;
           border: 1px solid var(--mm-border-strong);
-          border-radius: 12px;
-          padding: 10px 14px;
-          min-height: 44px;
+          border-radius: 11px;
+          padding: 9px 13px;
+          min-height: 42px;
           font-size: 14px;
           font-family: inherit;
           color-scheme: dark;
         }
         .input:focus {
-          outline: 2px solid var(--mm-primary);
+          outline: 2px solid var(--mm-sky-bright);
           border-color: transparent;
         }
         .input::placeholder {
           color: #64748b;
         }
         .input-date {
-          padding: 6px 10px;
-          min-height: 38px;
-          font-size: 13px;
+          padding: 5px 9px;
+          min-height: 34px;
+          font-size: 12.5px;
         }
 
         /* Calendar Grid & Day Cards */
         .calendar-grid {
           display: grid;
-          grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
-          gap: 14px;
+          grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+          gap: 12px;
         }
         .day-card {
           background: var(--mm-surface);
           border: 1px solid var(--mm-border);
-          border-radius: 16px;
-          padding: 14px 16px;
+          border-radius: 15px;
+          padding: 12px 14px;
           display: flex;
           flex-direction: column;
           justify-content: space-between;
-          transition: border-color 0.15s, transform 0.15s;
+          transition: border-color 0.15s;
+        }
+        .day-card.stripe-planned {
+          border-left: 4px solid #10b981;
+        }
+        .day-card.stripe-ok {
+          border-left: 4px solid #10b981;
+        }
+        .day-card.stripe-warn {
+          border-left: 4px solid #f59e0b;
+        }
+        .day-card.stripe-danger {
+          border-left: 4px solid #ef4444;
+        }
+        .day-card.stripe-pin {
+          border-left: 4px solid #38bdf8;
         }
         .day-card.day-today {
           border: 2px solid #38bdf8;
-          box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2), 0 8px 24px rgba(2, 132, 199, 0.18);
+          box-shadow: 0 4px 20px rgba(2, 132, 199, 0.18);
+        }
+        .day-card.day-unplanned {
+          background: rgba(21, 28, 44, 0.65);
+          border-style: dashed;
         }
         .day-card.day-skipped {
-          background: rgba(21, 28, 44, 0.55);
+          background: rgba(15, 23, 42, 0.45);
           border-style: dashed;
+          opacity: 0.82;
         }
         .day-card.day-swap-source {
           border: 2px dashed #fbbf24;
           background: rgba(245, 158, 11, 0.08);
         }
         .day-card.day-swap-target {
-          border-color: rgba(124, 58, 237, 0.55);
+          border-color: rgba(124, 58, 237, 0.6);
         }
         .day-card-top {
           display: flex;
           justify-content: space-between;
           align-items: center;
           gap: 8px;
-          padding-bottom: 10px;
-          border-bottom: 1px solid var(--mm-border);
-          margin-bottom: 12px;
+          margin-bottom: 8px;
         }
         .day-date-group {
           display: flex;
           align-items: center;
-          gap: 8px;
+          gap: 6px;
           flex-wrap: wrap;
         }
+        .card-top-right {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
         .day-date-label {
-          font-size: 14px;
+          font-size: 13px;
           font-weight: 800;
           color: #cbd5e1;
         }
         .day-date-label.today-highlight {
           color: #38bdf8;
         }
-        .meal-headline {
+        .badge-interactive {
+          border-radius: 8px;
+          padding: 3px 8px;
+          font-size: 11.5px;
+          font-weight: 700;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+        }
+        .badge-subtle {
+          background: rgba(148, 163, 184, 0.12);
+          color: #94a3b8;
+          border: 1px dashed rgba(148, 163, 184, 0.3);
+        }
+        .badge-subtle:hover {
+          color: #f8fafc;
+          border-color: #94a3b8;
+        }
+
+        /* Inline Collapsible Expiry Drawer (Only open when clicked) */
+        .inline-expiry-drawer {
+          background: #0f172a;
+          border: 1px solid var(--mm-border-strong);
+          border-radius: 11px;
+          padding: 9px 11px;
+          margin-bottom: 10px;
+        }
+        .expiry-drawer-header {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          gap: 10px;
-          padding: 8px 10px;
-          margin: -4px -6px 4px;
-          border-radius: 10px;
+          font-size: 11.5px;
+          font-weight: 700;
+          color: var(--mm-text-muted);
+          margin-bottom: 6px;
+        }
+        .expiry-drawer-controls {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 6px;
+          flex-wrap: wrap;
+        }
+
+        .meal-headline {
+          padding: 4px 6px;
+          margin: 0 -6px;
+          border-radius: 8px;
           cursor: pointer;
           transition: background 0.15s;
         }
@@ -2365,118 +2771,40 @@ class MealMindPanel extends HTMLElement {
           background: var(--mm-surface-elevated);
         }
         .meal-name-text {
-          font-size: 17px;
+          font-size: 16px;
           font-weight: 800;
           color: #ffffff;
+          line-height: 1.3;
         }
-        .edit-affordance {
-          font-size: 12px;
-          font-weight: 700;
-          color: #38bdf8;
-          background: rgba(56, 189, 248, 0.14);
-          padding: 4px 10px;
-          border-radius: 8px;
-          white-space: nowrap;
-        }
-        .day-expiry-bar {
+        .day-card-footer {
           display: flex;
           align-items: center;
-          justify-content: space-between;
           gap: 8px;
-          flex-wrap: wrap;
-          margin-top: 12px;
-          padding: 8px 10px;
-          background: rgba(15, 23, 42, 0.6);
-          border-radius: 10px;
-          border: 1px solid var(--mm-border);
-        }
-        .expiry-label {
-          font-size: 12px;
-          font-weight: 700;
-          color: var(--mm-text-muted);
-        }
-        .expiry-quick-pills {
-          display: flex;
-          gap: 4px;
-        }
-        .chip-btn {
-          background: var(--mm-surface-elevated);
-          color: #e2e8f0;
-          border: 1px solid var(--mm-border-strong);
-          border-radius: 8px;
-          padding: 5px 9px;
-          min-height: 34px;
-          font-size: 12px;
-          font-weight: 700;
-          cursor: pointer;
-        }
-        .chip-btn:hover {
-          background: var(--mm-primary);
-          color: #ffffff;
-        }
-        .day-action-bar {
-          display: flex;
-          gap: 6px;
-          flex-wrap: wrap;
           margin-top: 12px;
           padding-top: 10px;
           border-top: 1px solid var(--mm-border);
         }
-        .action-pill {
-          background: var(--mm-surface-elevated);
-          color: #e2e8f0;
-          border: 1px solid var(--mm-border);
-          border-radius: 10px;
-          padding: 7px 11px;
-          min-height: 38px;
-          font-size: 12px;
-          font-weight: 700;
-          cursor: pointer;
-          display: inline-flex;
-          align-items: center;
-          gap: 4px;
-          flex: 1;
-          justify-content: center;
-          white-space: nowrap;
-        }
-        .action-pill:hover {
-          background: var(--mm-surface-hover);
-          color: #ffffff;
-        }
-        .action-pill.active {
-          background: var(--mm-primary);
-          color: #ffffff;
-          border-color: var(--mm-primary);
-        }
-        .action-pill-danger {
-          flex: 0 0 auto;
-          color: var(--mm-danger-text);
-        }
         .empty-day-slot {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-          padding: 8px 0 2px;
+          padding: 4px 0 2px;
         }
         .btn-assign-meal {
-          flex: 1;
-          min-height: 48px;
-          border-radius: 12px;
-          border: 1px dashed rgba(56, 189, 248, 0.45);
-          background: rgba(2, 132, 199, 0.1);
-          color: #38bdf8;
-          font-size: 14px;
+          width: 100%;
+          min-height: 42px;
+          border-radius: 11px;
+          border: 1px dashed rgba(16, 185, 129, 0.45);
+          background: rgba(16, 185, 129, 0.1);
+          color: #34d399;
+          font-size: 13.5px;
           font-weight: 700;
           cursor: pointer;
           display: flex;
           align-items: center;
           justify-content: center;
-          gap: 8px;
+          gap: 6px;
           transition: all 0.15s;
         }
         .btn-assign-meal:hover {
-          background: var(--mm-primary);
+          background: var(--mm-emerald);
           color: #ffffff;
           border-style: solid;
         }
@@ -2485,17 +2813,18 @@ class MealMindPanel extends HTMLElement {
           align-items: center;
           justify-content: space-between;
           gap: 10px;
-          padding: 8px 0;
+          padding: 4px 0;
           color: var(--mm-text-muted);
+          font-size: 13px;
           font-weight: 600;
         }
         .swap-banner {
           background: rgba(245, 158, 11, 0.16);
           border: 2px solid #fbbf24;
           color: #fef3c7;
-          padding: 12px 16px;
-          border-radius: 14px;
-          margin-bottom: 16px;
+          padding: 10px 14px;
+          border-radius: 12px;
+          margin-bottom: 14px;
           display: flex;
           justify-content: space-between;
           align-items: center;
@@ -2507,47 +2836,52 @@ class MealMindPanel extends HTMLElement {
         .pill-row, .badge-row {
           display: flex;
           flex-wrap: wrap;
-          gap: 6px;
+          gap: 5px;
           align-items: center;
         }
         .pill {
           background: #1e293b;
-          color: #f1f5f9;
-          border: 1px solid rgba(148, 163, 184, 0.25);
+          color: #e2e8f0;
+          border: 1px solid rgba(148, 163, 184, 0.22);
           border-radius: 999px;
-          padding: 4px 11px;
-          font-size: 12px;
+          padding: 3px 10px;
+          font-size: 11.5px;
           font-weight: 600;
           display: inline-flex;
           align-items: center;
-          gap: 6px;
+          gap: 5px;
+        }
+        .pill-muted {
+          background: transparent;
+          color: #94a3b8;
+          border-style: dashed;
         }
         .pill-tag {
-          background: rgba(124, 58, 237, 0.22);
+          background: rgba(124, 58, 237, 0.2);
           color: #ddd6fe;
-          border-color: rgba(167, 139, 250, 0.35);
+          border-color: rgba(167, 139, 250, 0.3);
         }
         .pill-lg {
-          padding: 6px 13px;
-          font-size: 13px;
+          padding: 5px 12px;
+          font-size: 12.5px;
         }
         .pill-del {
-          background: rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.14);
           border: none;
           color: #ffffff;
           border-radius: 50%;
-          width: 20px;
-          height: 20px;
+          width: 18px;
+          height: 18px;
           cursor: pointer;
-          font-size: 11px;
+          font-size: 10px;
           display: inline-flex;
           align-items: center;
           justify-content: center;
         }
         .badge {
           border-radius: 8px;
-          padding: 4px 9px;
-          font-size: 12px;
+          padding: 3px 8px;
+          font-size: 11.5px;
           font-weight: 700;
           display: inline-flex;
           align-items: center;
@@ -2556,7 +2890,7 @@ class MealMindPanel extends HTMLElement {
         .badge-ok {
           background: var(--mm-success-bg);
           color: var(--mm-success-text);
-          border: 1px solid rgba(74, 222, 128, 0.3);
+          border: 1px solid rgba(52, 211, 153, 0.3);
         }
         .badge-warn {
           background: var(--mm-warn-bg);
@@ -2569,15 +2903,35 @@ class MealMindPanel extends HTMLElement {
           border: 1px solid rgba(248, 113, 113, 0.35);
         }
         .badge-pin {
-          background: rgba(56, 189, 248, 0.18);
+          background: rgba(56, 189, 248, 0.16);
           color: #38bdf8;
-          border: 1px solid rgba(56, 189, 248, 0.35);
+          border: 1px solid rgba(56, 189, 248, 0.3);
+        }
+
+        .expiry-quick-pills {
+          display: flex;
+          gap: 4px;
+        }
+        .chip-btn {
+          background: var(--mm-surface-elevated);
+          color: #e2e8f0;
+          border: 1px solid var(--mm-border-strong);
+          border-radius: 7px;
+          padding: 4px 8px;
+          min-height: 30px;
+          font-size: 11.5px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+        .chip-btn:hover {
+          background: var(--mm-sky);
+          color: #ffffff;
         }
 
         /* Database & AI Grid */
         .db-grid {
           display: grid;
-          grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+          grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
           gap: 14px;
         }
         .db-meal-card {
@@ -2593,14 +2947,14 @@ class MealMindPanel extends HTMLElement {
         }
         .db-meal-title {
           margin: 0;
-          font-size: 17px;
+          font-size: 16px;
           font-weight: 800;
           color: #ffffff;
         }
         .star-toggle {
           background: transparent;
           border: none;
-          font-size: 22px;
+          font-size: 20px;
           color: #64748b;
           cursor: pointer;
           padding: 2px;
@@ -2611,15 +2965,15 @@ class MealMindPanel extends HTMLElement {
         }
         .meal-notes {
           margin-top: 10px;
-          font-size: 13px;
+          font-size: 12.5px;
           color: var(--mm-text-muted);
           background: rgba(15, 23, 42, 0.5);
-          padding: 8px 10px;
+          padding: 7px 10px;
           border-radius: 8px;
         }
         .ai-reason-box {
           margin-top: 8px;
-          font-size: 13px;
+          font-size: 12.5px;
           font-weight: 600;
           color: #38bdf8;
           background: rgba(2, 132, 199, 0.12);
@@ -2644,7 +2998,7 @@ class MealMindPanel extends HTMLElement {
         }
         .search-input-wrap {
           position: relative;
-          min-width: 240px;
+          min-width: 220px;
           flex: 1;
         }
         .search-icon {
@@ -2656,83 +3010,115 @@ class MealMindPanel extends HTMLElement {
         }
         .input-search {
           width: 100%;
-          padding-left: 38px;
+          padding-left: 36px;
         }
         .filter-chip {
           background: var(--mm-surface-elevated);
           color: #cbd5e1;
           border: 1px solid var(--mm-border-strong);
           border-radius: 999px;
-          padding: 8px 14px;
-          min-height: 40px;
-          font-size: 13px;
+          padding: 7px 13px;
+          min-height: 38px;
+          font-size: 12.5px;
           font-weight: 700;
           cursor: pointer;
         }
         .filter-chip.active {
-          background: var(--mm-primary);
+          background: var(--mm-sky);
           color: #ffffff;
-          border-color: var(--mm-primary);
+          border-color: var(--mm-sky);
         }
 
-        /* Shopping & Scan Layout */
-        .shop-hero-bar {
-          background: linear-gradient(135deg, rgba(2, 132, 199, 0.18), rgba(124, 58, 237, 0.18));
-          border: 1px solid rgba(56, 189, 248, 0.35);
-          border-radius: 16px;
-          padding: 14px 16px;
-          margin-bottom: 16px;
+        /* Flattened Single-Layer Shopping Toolbar */
+        .shop-unified-toolbar {
+          background: var(--mm-surface);
+          border: 1px solid var(--mm-border);
+          border-radius: 14px;
+          padding: 10px 12px;
+          margin-bottom: 14px;
           display: flex;
           justify-content: space-between;
           align-items: center;
           flex-wrap: wrap;
-          gap: 12px;
-        }
-        .shop-hero-actions, .shop-hero-Right {
-          display: flex;
           gap: 10px;
+        }
+        .shop-category-pills {
+          display: flex;
+          gap: 6px;
           flex-wrap: wrap;
+        }
+        .cat-pill {
+          border: 1px solid var(--mm-border-strong);
+          background: var(--mm-surface-elevated);
+          color: #cbd5e1;
+          border-radius: 10px;
+          padding: 8px 13px;
+          min-height: 40px;
+          font-size: 13.5px;
+          font-weight: 700;
+          cursor: pointer;
+          display: inline-flex;
           align-items: center;
+          gap: 7px;
+          transition: all 0.15s;
+        }
+        .cat-count {
+          background: rgba(0, 0, 0, 0.3);
+          padding: 1px 7px;
+          border-radius: 999px;
+          font-size: 11.5px;
+        }
+        .cat-pill-food.active {
+          background: var(--mm-emerald);
+          color: #ffffff;
+          border-color: var(--mm-emerald-bright);
+          box-shadow: 0 2px 10px rgba(5, 150, 105, 0.35);
+        }
+        .cat-pill-nf.active {
+          background: var(--mm-amber);
+          color: #ffffff;
+          border-color: var(--mm-amber-bright);
+          box-shadow: 0 2px 10px rgba(217, 119, 6, 0.35);
+        }
+        .cat-pill-both.active {
+          background: var(--mm-sky);
+          color: #ffffff;
+          border-color: var(--mm-sky-bright);
+        }
+        .shop-toolbar-actions {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
         }
         .upload-hero-btn {
           cursor: pointer;
         }
-
-        /* Segmented Control */
-        .segmented-control {
+        .shop-hint-row {
           display: flex;
-          background: #0f172a;
-          padding: 5px;
-          border-radius: 14px;
-          border: 1px solid var(--mm-border-strong);
-          margin-bottom: 16px;
-          gap: 6px;
-        }
-        .seg-btn {
-          flex: 1;
-          min-height: 44px;
-          border: none;
-          border-radius: 10px;
-          background: transparent;
+          justify-content: space-between;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 8px;
+          font-size: 12px;
           color: var(--mm-text-muted);
-          font-size: 14px;
+          margin-bottom: 6px;
+        }
+        .undo-pill-btn {
+          background: rgba(245, 158, 11, 0.18);
+          color: #fbbf24;
+          border: 1px solid rgba(245, 158, 11, 0.4);
+          border-radius: 999px;
+          padding: 4px 12px;
+          font-size: 12px;
           font-weight: 700;
           cursor: pointer;
-          padding: 8px 12px;
-          transition: all 0.15s;
         }
-        .seg-btn.active {
-          background: var(--mm-primary);
-          color: #ffffff;
-          box-shadow: 0 2px 8px rgba(2, 132, 199, 0.35);
+        .undo-pill-btn:hover {
+          background: rgba(245, 158, 11, 0.3);
         }
 
-        .shop-workspace {
-          display: grid;
-          grid-template-columns: ${this._isCompanion ? "1fr" : "repeat(auto-fit, minmax(360px, 1fr))"};
-          gap: 16px;
-          align-items: start;
-        }
+        /* Shopping List Rows — Explicit Checkbox Button Only */
         .quick-input-bar {
           display: flex;
           gap: 8px;
@@ -2747,29 +3133,44 @@ class MealMindPanel extends HTMLElement {
           justify-content: space-between;
           align-items: center;
           gap: 12px;
-          padding: 12px 14px;
-          min-height: 54px;
+          padding: 10px 12px;
+          min-height: 52px;
           border-radius: 12px;
           background: var(--mm-surface-elevated);
           border: 1px solid var(--mm-border);
-          transition: background 0.12s;
         }
-        .shop-item-row:hover {
-          background: var(--mm-surface-hover);
-        }
-        .shop-item-label {
+        .shop-item-main {
           display: flex;
           align-items: center;
-          gap: 14px;
+          gap: 12px;
           flex: 1;
-          cursor: pointer;
         }
-        .modern-checkbox {
-          width: 24px;
-          height: 24px;
-          accent-color: var(--mm-primary);
+        .shop-check-btn {
+          width: 34px;
+          height: 34px;
+          border-radius: 10px;
+          border: 2px solid rgba(148, 163, 184, 0.45);
+          background: #0f172a;
+          color: transparent;
           cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
           flex-shrink: 0;
+          transition: all 0.15s;
+        }
+        .shop-check-btn:hover, .shop-check-btn:focus-visible {
+          border-color: #10b981;
+          background: rgba(16, 185, 129, 0.18);
+          color: #34d399;
+        }
+        .shop-check-circle {
+          font-size: 16px;
+          font-weight: 900;
+          line-height: 1;
+        }
+        .shop-item-text {
+          user-select: text;
         }
         .shop-item-name, .list-item-title {
           font-size: 15px;
@@ -2781,6 +3182,77 @@ class MealMindPanel extends HTMLElement {
           font-weight: 600;
           color: #38bdf8;
           margin-top: 2px;
+        }
+
+        /* Recently Completed Undo Tray */
+        .recently-completed-tray {
+          margin-top: 16px;
+          padding-top: 12px;
+          border-top: 1px dashed var(--mm-border-strong);
+        }
+        .recently-completed-toggle {
+          width: 100%;
+          background: rgba(15, 23, 42, 0.6);
+          border: 1px solid var(--mm-border);
+          color: #cbd5e1;
+          border-radius: 10px;
+          padding: 8px 12px;
+          font-size: 12.5px;
+          font-weight: 700;
+          cursor: pointer;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        }
+        .restore-chip-btn {
+          background: rgba(30, 41, 59, 0.9);
+          color: #e2e8f0;
+          border: 1px solid var(--mm-border-strong);
+          border-radius: 999px;
+          padding: 6px 12px;
+          font-size: 12.5px;
+          font-weight: 600;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .restore-chip-btn:hover {
+          border-color: #34d399;
+          color: #34d399;
+        }
+
+        .segmented-control {
+          display: flex;
+          background: #0f172a;
+          padding: 4px;
+          border-radius: 12px;
+          border: 1px solid var(--mm-border-strong);
+          gap: 6px;
+        }
+        .seg-btn {
+          flex: 1;
+          min-height: 40px;
+          border: none;
+          border-radius: 9px;
+          background: transparent;
+          color: var(--mm-text-muted);
+          font-size: 13.5px;
+          font-weight: 700;
+          cursor: pointer;
+          padding: 7px 12px;
+        }
+        .seg-btn.active {
+          background: var(--mm-sky);
+          color: #ffffff;
+        }
+
+        .modern-checkbox {
+          width: 22px;
+          height: 22px;
+          accent-color: var(--mm-emerald);
+          cursor: pointer;
+          flex-shrink: 0;
         }
         .day-eyebrow {
           font-size: 11px;
@@ -2798,7 +3270,7 @@ class MealMindPanel extends HTMLElement {
 
         /* Guest Box & AI */
         .guest-override-card {
-          padding: 14px 16px;
+          padding: 12px 14px;
           border-radius: 14px;
           border: 1px solid var(--mm-border-strong);
           background: var(--mm-surface-elevated);
@@ -2829,7 +3301,7 @@ class MealMindPanel extends HTMLElement {
           display: flex;
           align-items: center;
           justify-content: center;
-          z-index: 1000;
+          z-index: 1300;
           padding: 16px;
         }
         .modal-sheet {
@@ -2837,7 +3309,7 @@ class MealMindPanel extends HTMLElement {
           color: var(--mm-text);
           border: 1px solid var(--mm-border-strong);
           border-radius: 20px;
-          padding: 22px;
+          padding: 20px;
           width: 100%;
           max-width: 560px;
           max-height: 90vh;
@@ -2855,7 +3327,7 @@ class MealMindPanel extends HTMLElement {
         }
         .modal-title {
           margin: 2px 0 0;
-          font-size: 20px;
+          font-size: 19px;
           font-weight: 800;
           color: #ffffff;
         }
@@ -2863,7 +3335,7 @@ class MealMindPanel extends HTMLElement {
           display: flex;
           justify-content: flex-end;
           gap: 10px;
-          margin-top: 20px;
+          margin-top: 18px;
           padding-top: 14px;
           border-top: 1px solid var(--mm-border);
         }
@@ -2909,26 +3381,21 @@ class MealMindPanel extends HTMLElement {
           justify-content: space-between;
           align-items: center;
           gap: 12px;
-          padding: 12px 14px;
-          border-radius: 14px;
+          padding: 11px 14px;
+          border-radius: 13px;
           background: var(--mm-surface-elevated);
           border: 1px solid var(--mm-border);
-          transition: all 0.12s;
         }
         .picker-meal-row:hover {
-          border-color: #38bdf8;
+          border-color: #10b981;
           background: var(--mm-surface-hover);
-        }
-        .picker-meal-row.selected {
-          border: 2px solid #38bdf8;
-          background: rgba(2, 132, 199, 0.18);
         }
         .picker-meal-info {
           flex: 1;
           cursor: pointer;
         }
         .picker-meal-name {
-          font-size: 16px;
+          font-size: 15.5px;
           font-weight: 800;
           color: #ffffff;
         }
@@ -2938,7 +3405,6 @@ class MealMindPanel extends HTMLElement {
           align-items: center;
         }
 
-        /* Scan Modal Grid */
         .scan-modal-grid {
           display: grid;
           grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -2974,7 +3440,7 @@ class MealMindPanel extends HTMLElement {
           gap: 12px;
         }
         .empty-state {
-          padding: 28px 18px;
+          padding: 24px 16px;
           text-align: center;
           color: var(--mm-text-muted);
           border: 1px dashed var(--mm-border-strong);
@@ -2982,41 +3448,53 @@ class MealMindPanel extends HTMLElement {
           background: rgba(15, 23, 42, 0.4);
         }
         .empty-icon {
-          font-size: 32px;
-          margin-bottom: 8px;
+          font-size: 28px;
+          margin-bottom: 6px;
         }
 
-        /* Toast */
+        /* Toast with Interactive Undo Button */
         .toast {
           position: fixed;
           bottom: 84px;
           right: 20px;
-          padding: 12px 18px;
+          padding: 11px 16px;
           border-radius: 12px;
-          background: #0284c7;
+          background: #0f172a;
+          border: 1px solid #38bdf8;
           color: #ffffff;
           font-weight: 700;
-          font-size: 14px;
+          font-size: 13.5px;
           z-index: 2000;
-          box-shadow: 0 10px 25px rgba(0, 0, 0, 0.45);
+          box-shadow: 0 12px 28px rgba(0, 0, 0, 0.6);
+          display: flex;
+          align-items: center;
+          gap: 12px;
         }
         .toast.error {
-          background: #dc2626;
+          background: #7f1d1d;
+          border-color: #f87171;
+        }
+        .toast-undo-btn {
+          background: #f59e0b;
+          color: #0b0f19;
+          border: none;
+          border-radius: 8px;
+          padding: 5px 11px;
+          font-size: 12.5px;
+          font-weight: 800;
+          cursor: pointer;
         }
 
         /* Responsive Mobile Rules */
         @media (max-width: 768px) {
           :host {
-            padding: 14px 12px 92px;
+            padding: 12px 10px 92px;
           }
           .desktop-tabs {
             display: none;
           }
           .mobile-bottom-nav {
             display: flex;
-          }
-          .subview-hidden-mobile {
-            display: none !important;
           }
           .modal-backdrop {
             align-items: flex-end;
@@ -3025,29 +3503,76 @@ class MealMindPanel extends HTMLElement {
           .modal-sheet {
             border-radius: 22px 22px 0 0;
             max-height: 92vh;
-            padding: 18px 16px 28px;
+            padding: 18px 14px 28px;
           }
         }
       </style>
 
       ${allIngsDatalist}
 
-      <!-- Header Bar -->
+      <!-- Header Bar with Home Assistant Companion Sidebar Toggle + Consolidated Print Dropdown -->
       <div class="app-header">
         <div class="brand-wrap">
+          <button class="ha-menu-btn" id="ha-menu-toggle-btn" title="Open Home Assistant Sidebar Menu">
+            ☰
+          </button>
           <div class="brand-logo">🍽️</div>
           <div>
             <h1 class="brand-title">MealMind</h1>
             <p class="brand-subtitle">
-              ${this._isCompanion ? "Online Shopping Companion" : "Smart Meal Planner & Receipt Sync"}
+              ${this._isCompanion ? "Shopping Companion" : "Smart Meal Planner"}
             </p>
           </div>
         </div>
 
         <div class="header-actions">
-          <button class="btn btn-secondary btn-sm" id="top-print-today">🖨️ Today's Card</button>
-          <button class="btn btn-secondary btn-sm" id="top-print-7d">🖨️ Next 7 Days</button>
-          <button class="btn btn-secondary btn-sm" id="top-print-shop">🖨️ Shopping List</button>
+          ${
+            this._isCompanion
+              ? `<button class="btn btn-secondary btn-sm" id="exit-companion-btn">← Close</button>`
+              : ""
+          }
+          <div class="menu-anchor">
+            <button class="btn btn-secondary btn-sm" id="toggle-print-menu-btn">
+              🖨️ Print ▾
+            </button>
+            ${
+              this._printMenuOpen
+                ? `
+                  <div class="pop-menu pop-menu-wide">
+                    <button class="pop-menu-item" id="top-print-today">
+                      <span>📄</span>
+                      <div>
+                        <div>Today's Meal Card</div>
+                        <span class="pop-menu-item-sub">Full recipe card with ingredients & notes for today</span>
+                      </div>
+                    </button>
+                    <button class="pop-menu-item" id="top-print-7d-cards">
+                      <span>🗂️</span>
+                      <div>
+                        <div>Next 7 Days' Meal Cards (All Planned)</div>
+                        <span class="pop-menu-item-sub">Prints an individual full card for every planned day</span>
+                      </div>
+                    </button>
+                    <button class="pop-menu-item" id="top-print-7d">
+                      <span>📅</span>
+                      <div>
+                        <div>Next 7 Days Summary Ticket</div>
+                        <span class="pop-menu-item-sub">Compact single-slip weekly schedule overview</span>
+                      </div>
+                    </button>
+                    <div class="pop-menu-divider"></div>
+                    <button class="pop-menu-item" id="top-print-shop">
+                      <span>🛒</span>
+                      <div>
+                        <div>Shopping List (Food & Non-Food)</div>
+                        <span class="pop-menu-item-sub">Checkbox paper list for pen check-off & photo scan</span>
+                      </div>
+                    </button>
+                  </div>
+                `
+                : ""
+            }
+          </div>
         </div>
       </div>
 
@@ -3057,7 +3582,7 @@ class MealMindPanel extends HTMLElement {
           📅 Meal Calendar
         </button>
         <button class="tab-btn ${this._activeTab === "shop" ? "active" : ""}" data-tab="shop">
-          🛒 Shop & Receipt Scan <span class="tab-count">${shopCount}</span>
+          🛒 Shopping List <span class="tab-count">${shopCount}</span>
         </button>
         <button class="tab-btn ${this._activeTab === "database" ? "active" : ""}" data-tab="database">
           🍲 Saved Meals <span class="tab-count">${mealCount}</span>
@@ -3106,7 +3631,14 @@ class MealMindPanel extends HTMLElement {
       ${this._renderModals()}
       ${
         this._toast
-          ? `<div class="toast ${this._toast.isError ? "error" : ""}">${this._escapeHtml(this._toast.msg)}</div>`
+          ? `<div class="toast ${this._toast.isError ? "error" : ""}">
+              <span>${this._escapeHtml(this._toast.msg)}</span>
+              ${
+                this._toast.undoAction
+                  ? `<button class="toast-undo-btn" id="toast-undo-btn">${this._escapeHtml(this._toast.undoAction.label)}</button>`
+                  : ""
+              }
+            </div>`
           : ""
       }
     `;
@@ -3118,26 +3650,57 @@ class MealMindPanel extends HTMLElement {
     const root = this.shadowRoot;
     if (!root) return;
 
-    // Top print buttons
+    // HA Sidebar Toggle (fixes missing sidebar button on Companion App!)
+    const haMenuBtn = root.getElementById("ha-menu-toggle-btn");
+    if (haMenuBtn) {
+      haMenuBtn.onclick = () => this._toggleHaSidebar();
+    }
+
+    const exitCompanionBtn = root.getElementById("exit-companion-btn");
+    if (exitCompanionBtn) {
+      exitCompanionBtn.onclick = () => {
+        if (window.opener) {
+          window.close();
+        } else {
+          window.location.href = "/mealmind";
+        }
+      };
+    }
+
+    // Consolidated Print Dropdown Menu
+    const togglePrintBtn = root.getElementById("toggle-print-menu-btn");
+    if (togglePrintBtn) {
+      togglePrintBtn.onclick = (e) => {
+        e.stopPropagation();
+        const next = !this._printMenuOpen;
+        this._closeAllMenus();
+        this._printMenuOpen = next;
+        this._render();
+      };
+    }
     const btnToday = root.getElementById("top-print-today");
     if (btnToday) btnToday.onclick = () => this._handlePrint("today_card");
+    const btn7dCards = root.getElementById("top-print-7d-cards");
+    if (btn7dCards) btn7dCards.onclick = () => this._handlePrint("next_7_days_cards");
     const btn7d = root.getElementById("top-print-7d");
     if (btn7d) btn7d.onclick = () => this._handlePrint("next_7_days");
     const btnShop = root.getElementById("top-print-shop");
     if (btnShop) btnShop.onclick = () => this._handlePrint("shopping_list");
 
+    // Toast Undo button
+    const toastUndoBtn = root.getElementById("toast-undo-btn");
+    if (toastUndoBtn && this._toast && this._toast.undoAction) {
+      toastUndoBtn.onclick = () => {
+        const ua = this._toast.undoAction;
+        this._undoCompletedShoppingItem(ua.summary, ua.listType);
+      };
+    }
+
     // Tab navigation (Desktop & Mobile bottom nav)
     root.querySelectorAll(".tab-btn, .mob-nav-btn").forEach((btn) => {
       btn.onclick = () => {
+        this._closeAllMenus();
         this._activeTab = btn.dataset.tab;
-        this._render();
-      };
-    });
-
-    // Shop Sub-View switcher
-    root.querySelectorAll(".seg-btn[data-subview]").forEach((btn) => {
-      btn.onclick = () => {
-        this._shopSubView = btn.dataset.subview;
         this._render();
       };
     });
@@ -3186,7 +3749,37 @@ class MealMindPanel extends HTMLElement {
       };
     });
 
-    // Day Card buttons & Drag-and-Drop
+    // Day Card 3-dot menu toggle & Expiry inline drawer toggle
+    root.querySelectorAll(".card-menu-toggle-btn").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const dStr = btn.dataset.date;
+        const next = this._openCardMenuDate === dStr ? null : dStr;
+        this._closeAllMenus();
+        this._openCardMenuDate = next;
+        this._render();
+      };
+    });
+
+    root.querySelectorAll(".toggle-exp-popover-btn").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const dStr = btn.dataset.date;
+        this._closeAllMenus();
+        this._openExpiryDate = this._openExpiryDate === dStr ? null : dStr;
+        this._render();
+      };
+    });
+
+    root.querySelectorAll(".exp-clear-btn").forEach((btn) => {
+      btn.onclick = () => this._handleQuickExpiryChange(btn.dataset.date, "");
+    });
+
+    root.querySelectorAll(".print-day-card-btn").forEach((btn) => {
+      btn.onclick = () => this._handlePrint("today_card", btn.dataset.date);
+    });
+
+    // Day Card Drag-and-Drop
     root.querySelectorAll(".day-card").forEach((card) => {
       const dStr = card.dataset.date;
       card.ondragstart = (ev) => {
@@ -3207,6 +3800,7 @@ class MealMindPanel extends HTMLElement {
 
     root.querySelectorAll(".swap-start-btn").forEach((btn) => {
       btn.onclick = () => {
+        this._closeAllMenus();
         this._swapSourceDate =
           this._swapSourceDate === btn.dataset.date ? null : btn.dataset.date;
         this._render();
@@ -3232,9 +3826,15 @@ class MealMindPanel extends HTMLElement {
     });
     root.querySelectorAll(".shop-day-btn").forEach((btn) => {
       btn.onclick = () => {
+        this._closeAllMenus();
         const slot = this._state.schedule[btn.dataset.date] || {};
         const dbMeal = slot.meal_id ? this._state.meals[slot.meal_id] : null;
-        const ings = dbMeal ? dbMeal.ingredients || [] : [];
+        const ings =
+          slot.ingredients && slot.ingredients.length > 0
+            ? slot.ingredients
+            : dbMeal
+            ? dbMeal.ingredients || []
+            : [];
         this._openIngredientReviewModal(
           slot.meal_name || (dbMeal && dbMeal.name) || "Meal",
           ings
@@ -3285,6 +3885,17 @@ class MealMindPanel extends HTMLElement {
     const emptyNewDbBtn = root.getElementById("empty-new-db-meal-btn");
     if (emptyNewDbBtn) emptyNewDbBtn.onclick = () => this._openMealModal(null);
 
+    root.querySelectorAll(".db-menu-toggle-btn").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        const next = this._openDbMenuId === id ? null : id;
+        this._closeAllMenus();
+        this._openDbMenuId = next;
+        this._render();
+      };
+    });
+
     root.querySelectorAll(".db-star-btn").forEach((btn) => {
       btn.onclick = () => {
         const meal = this._state.meals[btn.dataset.id];
@@ -3317,6 +3928,7 @@ class MealMindPanel extends HTMLElement {
     });
     root.querySelectorAll(".db-shop-btn").forEach((btn) => {
       btn.onclick = () => {
+        this._closeAllMenus();
         const meal = this._state.meals[btn.dataset.id];
         if (meal) this._openIngredientReviewModal(meal.name, meal.ingredients || []);
       };
@@ -3377,6 +3989,26 @@ class MealMindPanel extends HTMLElement {
     });
 
     // Shopping & Scan Tab listeners
+    const shopMoreBtn = root.getElementById("shop-more-menu-btn");
+    if (shopMoreBtn) {
+      shopMoreBtn.onclick = (e) => {
+        e.stopPropagation();
+        const next = !this._shopMoreMenuOpen;
+        this._closeAllMenus();
+        this._shopMoreMenuOpen = next;
+        this._render();
+      };
+    }
+
+    const openUnpackBtn = root.getElementById("open-unpack-modal-btn");
+    if (openUnpackBtn) {
+      openUnpackBtn.onclick = () => {
+        this._closeAllMenus();
+        this._unpackModal = true;
+        this._render();
+      };
+    }
+
     const popoutBtn = root.getElementById("popout-companion-btn");
     if (popoutBtn) popoutBtn.onclick = () => this._openCompanionPopup();
     const printShopBtn = root.getElementById("print-shop-btn");
@@ -3392,10 +4024,16 @@ class MealMindPanel extends HTMLElement {
     }
 
     root.querySelectorAll(".quick-open-picker-btn").forEach((btn) => {
-      btn.onclick = () => this._openDayModal(this._findNextOpenDateStr(), "pick");
+      btn.onclick = () => {
+        this._unpackModal = false;
+        this._openDayModal(this._findNextOpenDateStr(), "pick");
+      };
     });
     root.querySelectorAll(".quick-open-custom-btn").forEach((btn) => {
-      btn.onclick = () => this._openDayModal(this._findNextOpenDateStr(), "custom");
+      btn.onclick = () => {
+        this._unpackModal = false;
+        this._openDayModal(this._findNextOpenDateStr(), "custom");
+      };
     });
     root.querySelectorAll(".quick-auto-schedule-btn").forEach((btn) => {
       btn.onclick = () => this._handleAutoSchedule();
@@ -3404,6 +4042,7 @@ class MealMindPanel extends HTMLElement {
     const reopenScanModalBtn = root.getElementById("reopen-scan-modal-btn");
     if (reopenScanModalBtn) {
       reopenScanModalBtn.onclick = () => {
+        this._closeAllMenus();
         this._postScanModal = true;
         this._render();
       };
@@ -3452,11 +4091,39 @@ class MealMindPanel extends HTMLElement {
       };
     }
 
-    root.querySelectorAll(".shop-check").forEach((chk) => {
-      chk.onchange = () => {
-        if (chk.checked) {
-          this._completeShoppingItem(chk.dataset.uid, chk.dataset.listType || "food");
-        }
+    // Explicit checkbox button only!
+    root.querySelectorAll(".shop-check-btn").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        this._completeShoppingItem(
+          btn.dataset.uid,
+          btn.dataset.summary,
+          btn.dataset.listType || "food"
+        );
+      };
+    });
+
+    // Undo / Restore recently completed items
+    const undoLatestBtn = root.getElementById("undo-latest-btn");
+    if (undoLatestBtn && this._recentlyCompleted.length > 0) {
+      undoLatestBtn.onclick = () => {
+        const latest = this._recentlyCompleted[0];
+        this._undoCompletedShoppingItem(latest.summary, latest.listType);
+      };
+    }
+    const toggleRecentBtn = root.getElementById("toggle-recent-completed-btn");
+    if (toggleRecentBtn) {
+      toggleRecentBtn.onclick = () => {
+        this._showRecentlyCompleted = !this._showRecentlyCompleted;
+        this._render();
+      };
+    }
+    root.querySelectorAll(".restore-chip-btn").forEach((btn) => {
+      btn.onclick = () => {
+        this._undoCompletedShoppingItem(
+          btn.dataset.summary,
+          btn.dataset.listType || "food"
+        );
       };
     });
 
@@ -3756,6 +4423,18 @@ class MealMindPanel extends HTMLElement {
       if (closeBtn) closeBtn.onclick = closeScan;
       const doneBtn = root.getElementById("done-post-scan-modal");
       if (doneBtn) doneBtn.onclick = closeScan;
+    }
+
+    // Modal 5: Unpack / Expiry Modal Sheet
+    if (this._unpackModal) {
+      const closeUnpack = () => {
+        this._unpackModal = false;
+        this._render();
+      };
+      const closeBtn = root.getElementById("close-unpack-modal");
+      if (closeBtn) closeBtn.onclick = closeUnpack;
+      const doneBtn = root.getElementById("done-unpack-modal");
+      if (doneBtn) doneBtn.onclick = closeUnpack;
     }
   }
 }

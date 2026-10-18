@@ -22,6 +22,18 @@ print_next_7_days:
       selector:
         text:
 
+print_next_7_days_cards:
+  name: Print Next 7 Days Meal Cards
+  description: Print an individual full Meal Card (ingredients, shortest expiry date, and notes) for every day in the next 7 days that has a meal planned.
+  fields:
+    start_date:
+      name: Start Date
+      description: Optional YYYY-MM-DD start date (defaults to today).
+      required: false
+      example: "2026-10-18"
+      selector:
+        text:
+
 print_shopping_list:
   name: Print Shopping List
   description: Print active items from the shopping list formatted with checkboxes for pen cross-out and receipt scanning.

@@ -16,6 +16,7 @@ from .const import DOMAIN
 from .coordinator import MealMindCoordinator
 from .printer_helper import (
     async_print_next_7_days,
+    async_print_next_7_days_cards,
     async_print_shopping_list,
     async_print_today_card,
 )
@@ -666,7 +667,9 @@ async def ws_receipt_scan(
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "mealmind/printer/print",
-        vol.Required("mission"): vol.In(["today_card", "next_7_days", "shopping_list"]),
+        vol.Required("mission"): vol.In(
+            ["today_card", "next_7_days", "next_7_days_cards", "shopping_list"]
+        ),
         vol.Optional("date"): vol.Any(str, None),
     }
 )
@@ -681,13 +684,19 @@ async def ws_printer_print(
     mission = msg["mission"]
     target_date = msg.get("date")
     try:
+        printed_count: int | None = None
         if mission == "today_card":
             await async_print_today_card(hass, store, target_date)
         elif mission == "next_7_days":
             await async_print_next_7_days(hass, store, target_date)
+        elif mission == "next_7_days_cards":
+            printed_count = await async_print_next_7_days_cards(hass, store, target_date)
         elif mission == "shopping_list":
             await async_print_shopping_list(hass, store)
-        connection.send_result(msg["id"], {"printed": True, "mission": mission})
+        connection.send_result(
+            msg["id"],
+            {"printed": True, "mission": mission, "printed_count": printed_count},
+        )
     except Exception as err:  # noqa: BLE001
         _LOGGER.exception("MealMind printer mission '%s' failed", mission)
         connection.send_error(msg["id"], "print_error", str(err))
