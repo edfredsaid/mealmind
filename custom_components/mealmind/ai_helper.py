@@ -12,10 +12,12 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
-GEMINI_MODELS = [
+GEMINI_PREFERRED_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-pro-latest",
 ]
 
 
@@ -32,6 +34,29 @@ def _get_gemini_api_key(hass: HomeAssistant, settings: dict[str, Any]) -> str | 
     return None
 
 
+def _get_configured_ha_gemini_models(hass: HomeAssistant) -> list[str]:
+    """Check if HA's google_generative_ai_conversation has a specific chat_model configured."""
+    found: list[str] = []
+    entries = hass.config_entries.async_entries("google_generative_ai_conversation")
+    for entry in entries:
+        for source in [entry.options, entry.data]:
+            cm = source.get("chat_model")
+            if cm and isinstance(cm, str):
+                short = cm.replace("models/", "").strip()
+                if short and short not in found:
+                    found.append(short)
+        subentries = getattr(entry, "subentries", None)
+        if isinstance(subentries, dict):
+            for sub in subentries.values():
+                sub_data = getattr(sub, "data", {}) or {}
+                cm = sub_data.get("chat_model")
+                if cm and isinstance(cm, str):
+                    short = cm.replace("models/", "").strip()
+                    if short and short not in found:
+                        found.append(short)
+    return found
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     """Extract JSON object from LLM text response."""
     text = text.strip()
@@ -44,6 +69,52 @@ def _extract_json(text: str) -> dict[str, Any]:
         if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
             text = text[brace_start : brace_end + 1]
     return json.loads(text)
+
+
+async def _discover_available_gemini_models(hass: HomeAssistant, api_key: str) -> list[str]:
+    """Query the Gemini ListModels endpoint to find supported generateContent flash/pro models."""
+    cached = hass.data.get("mealmind_gemini_models")
+    if isinstance(cached, list) and cached:
+        return cached
+
+    session = async_get_clientsession(hass)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        async with session.get(url, timeout=15) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                _LOGGER.warning("Gemini ListModels returned HTTP %s: %s", resp.status, body[:200])
+                return []
+            data = await resp.json()
+            models: list[str] = []
+            excluded_keywords = ("tts", "embedding", "imagen", "veo", "audio", "robotics", "computer-use", "1.5", "1.0")
+            for m in data.get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                name = m.get("name", "")
+                if "generateContent" in methods and name.startswith("models/gemini"):
+                    short_name = name.split("models/", 1)[1]
+                    if not any(kw in short_name.lower() for kw in excluded_keywords):
+                        models.append(short_name)
+
+            def _model_rank(m_name: str) -> tuple[int, str]:
+                if m_name in GEMINI_PREFERRED_MODELS:
+                    return (GEMINI_PREFERRED_MODELS.index(m_name), m_name)
+                if "flash" in m_name and "lite" not in m_name:
+                    return (10, m_name)
+                if "flash" in m_name:
+                    return (20, m_name)
+                if "pro" in m_name:
+                    return (30, m_name)
+                return (50, m_name)
+
+            models.sort(key=_model_rank)
+            if models:
+                hass.data["mealmind_gemini_models"] = models
+                _LOGGER.info("MealMind discovered available Gemini models: %s", models[:6])
+            return models
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("Failed to list Gemini models: %s", err)
+        return []
 
 
 async def _call_gemini_rest(
@@ -76,32 +147,60 @@ async def _call_gemini_rest(
     payload = {
         "contents": [{"parts": parts}],
         "generationConfig": {
-            "temperature": 0.4 if image_base64 else 0.7,
+            "temperature": 0.2 if image_base64 else 0.7,
             "responseMimeType": "application/json",
         },
     }
 
-    last_err = None
-    for model in GEMINI_MODELS:
+    # Build ordered list of candidate models: HA configured -> discovered -> preferred static
+    candidate_models: list[str] = []
+    for m in _get_configured_ha_gemini_models(hass):
+        if m not in candidate_models and "1.5" not in m:
+            candidate_models.append(m)
+    for m in await _discover_available_gemini_models(hass, api_key):
+        if m not in candidate_models:
+            candidate_models.append(m)
+    for m in GEMINI_PREFERRED_MODELS:
+        if m not in candidate_models:
+            candidate_models.append(m)
+
+    errors: list[str] = []
+
+    for model in candidate_models[:5]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         try:
-            async with session.post(url, json=payload, timeout=45) as resp:
+            async with session.post(url, json=payload, timeout=60) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     candidates = data.get("candidates", [])
                     if candidates:
                         content_parts = candidates[0].get("content", {}).get("parts", [])
-                        if content_parts and "text" in content_parts[0]:
-                            return _extract_json(content_parts[0]["text"])
+                        # Filter out thinking parts (thought: True) returned by Gemini 2.5+ thinking models
+                        non_thought_texts = [
+                            p["text"]
+                            for p in content_parts
+                            if isinstance(p, dict) and "text" in p and not p.get("thought")
+                        ]
+                        all_texts = non_thought_texts or [
+                            p["text"] for p in content_parts if isinstance(p, dict) and "text" in p
+                        ]
+                        for text_part in reversed(all_texts):
+                            try:
+                                return _extract_json(text_part)
+                            except Exception as parse_err:  # noqa: BLE001
+                                _LOGGER.warning("MealMind %s JSON parse failed: %s", model, parse_err)
+                                errors.append(f"{model} JSON parse error: {parse_err}")
+                    else:
+                        errors.append(f"{model} returned no candidates: {str(data)[:160]}")
                 else:
                     body = await resp.text()
-                    last_err = f"HTTP {resp.status} from {model}: {body[:200]}"
-                    _LOGGER.debug("Gemini model %s returned %s: %s", model, resp.status, body[:200])
+                    _LOGGER.warning("MealMind %s returned HTTP %s: %s", model, resp.status, body[:200])
+                    errors.append(f"HTTP {resp.status} from {model}: {body[:160]}")
         except Exception as err:  # noqa: BLE001
-            last_err = str(err)
-            _LOGGER.debug("Gemini model %s error: %s", model, err)
+            _LOGGER.warning("MealMind %s request error: %s", model, err)
+            errors.append(f"{model} error: {err}")
 
-    raise RuntimeError(f"Gemini API call failed: {last_err}")
+    raise RuntimeError("Gemini API call failed: " + " | ".join(errors[:3]))
 
 
 async def _call_ha_conversation_fallback(

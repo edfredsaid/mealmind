@@ -601,6 +601,38 @@ class MealMindPanel extends HTMLElement {
     }
   }
 
+  _compressImageFile(file, maxDim = 1600, quality = 0.85) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Failed to read image file"));
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => resolve({ dataUrl: reader.result, mimeType: file.type || "image/jpeg" });
+        img.onload = () => {
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            if (width >= height) {
+              height = Math.round((height * maxDim) / width);
+              width = maxDim;
+            } else {
+              width = Math.round((width * maxDim) / height);
+              height = maxDim;
+            }
+          }
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, width, height);
+          const dataUrl = canvas.toDataURL("image/jpeg", quality);
+          resolve({ dataUrl, mimeType: "image/jpeg" });
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
   async _handleReceiptFileChange(event) {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
@@ -608,31 +640,27 @@ class MealMindPanel extends HTMLElement {
     this._scanSummary = null;
     this._render();
 
-    const reader = new FileReader();
-    reader.onload = async () => {
-      try {
-        const base64Data = reader.result;
-        const res = await this._wsCall({
-          type: "mealmind/receipt/scan",
-          image_base64: base64Data,
-          mime_type: file.type || "image/jpeg",
-          auto_complete: true,
-        });
-        this._scanLoading = false;
-        this._scanSummary = {
-          ...(res.scan_result || {}),
-          completed_summaries: res.completed_summaries || [],
-        };
-        this._updateLocalState(res);
-        this._showToast(
-          `Checked off ${(res.completed_summaries || []).length} crossed-out/ticked item(s)!`
-        );
-      } catch (err) {
-        this._scanLoading = false;
-        this._showToast("Receipt photo scan failed: " + (err.message || err), true);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const { dataUrl, mimeType } = await this._compressImageFile(file);
+      const res = await this._wsCall({
+        type: "mealmind/receipt/scan",
+        image_base64: dataUrl,
+        mime_type: mimeType,
+        auto_complete: true,
+      });
+      this._scanLoading = false;
+      this._scanSummary = {
+        ...(res.scan_result || {}),
+        completed_summaries: res.completed_summaries || [],
+      };
+      this._updateLocalState(res);
+      this._showToast(
+        `Checked off ${(res.completed_summaries || []).length} crossed-out/ticked item(s)!`
+      );
+    } catch (err) {
+      this._scanLoading = false;
+      this._showToast("Receipt photo scan failed: " + (err.message || err), true);
+    }
   }
 
   // ---------------------------------------------------------------------------
