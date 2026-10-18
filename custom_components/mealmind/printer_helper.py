@@ -196,20 +196,35 @@ async def async_print_shopping_list(
     hass: HomeAssistant,
     store: MealMindStore,
 ) -> None:
-    """Print the active shopping list formatted for easy pen check-off and photo scanning."""
+    """Print the active Food and Non-Food shopping lists formatted for pen check-off and photo scanning."""
     settings = store.get_settings()
     printer_entity = settings.get("printer_entity", "notify.hall_stairs_hallway_receipt_printer")
     todo_entity = settings.get("todo_entity", "todo.shopping_list")
+    non_food_entity = settings.get("non_food_todo_entity", "todo.non_food_shopping")
 
-    res = await hass.services.async_call(
-        "todo",
-        "get_items",
-        {"status": ["needs_action"]},
-        target={"entity_id": [todo_entity]},
-        blocking=True,
-        return_response=True,
-    )
-    items: list[dict[str, Any]] = res.get(todo_entity, {}).get("items", [])
+    food_items: list[dict[str, Any]] = []
+    if hass.states.get(todo_entity):
+        res_food = await hass.services.async_call(
+            "todo",
+            "get_items",
+            {"status": ["needs_action"]},
+            target={"entity_id": [todo_entity]},
+            blocking=True,
+            return_response=True,
+        )
+        food_items = res_food.get(todo_entity, {}).get("items", [])
+
+    non_food_items: list[dict[str, Any]] = []
+    if non_food_entity and hass.states.get(non_food_entity):
+        res_nf = await hass.services.async_call(
+            "todo",
+            "get_items",
+            {"status": ["needs_action"]},
+            target={"entity_id": [non_food_entity]},
+            blocking=True,
+            return_response=True,
+        )
+        non_food_items = res_nf.get(non_food_entity, {}).get("items", [])
 
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines: list[str] = [
@@ -218,18 +233,35 @@ async def async_print_shopping_list(
         "================================",
     ]
 
-    if not items:
-        lines.append("  (Shopping list is empty!)")
+    if not food_items and not non_food_items:
+        lines.append("  (Shopping lists are empty!)")
     else:
-        for item in items:
-            summary = item.get("summary", "")
-            desc = item.get("description", "")
-            lines.append(f"[ ] {summary}")
-            if desc:
-                lines.append(f"    ({desc})")
+        lines.append(f"--- FOOD & GROCERIES ({len(food_items)}) ---")
+        if not food_items:
+            lines.append("  (None)")
+        else:
+            for item in food_items:
+                summary = item.get("summary", "")
+                desc = item.get("description", "")
+                lines.append(f"[ ] {summary}")
+                if desc:
+                    lines.append(f"    ({desc})")
 
+        lines.append("--------------------------------")
+        lines.append(f"--- NON-FOOD / HOUSEHOLD ({len(non_food_items)}) ---")
+        if not non_food_items:
+            lines.append("  (None)")
+        else:
+            for item in non_food_items:
+                summary = item.get("summary", "")
+                desc = item.get("description", "")
+                lines.append(f"[ ] {summary}")
+                if desc:
+                    lines.append(f"    ({desc})")
+
+    total_count = len(food_items) + len(non_food_items)
     lines.append("================================")
-    lines.append(f"Total items: {len(items)}")
+    lines.append(f"Total items: {total_count} ({len(food_items)} food, {len(non_food_items)} non-food)")
 
     await hass.services.async_call(
         "escpos_printer",

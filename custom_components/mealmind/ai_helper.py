@@ -332,23 +332,31 @@ async def async_scan_receipt_photo(
             "No Google Generative AI API key found. Ensure the Google Generative AI integration is configured."
         )
 
-    items_list = [{"uid": item.get("uid"), "summary": item.get("summary")} for item in shopping_items]
+    items_list = [
+        {
+            "uid": item.get("uid"),
+            "summary": item.get("summary"),
+            "list_type": item.get("list_type", "food"),
+        }
+        for item in shopping_items
+    ]
 
-    prompt = f"""You are examining a photo of a printed paper shopping list (or handwritten/receipt shopping list).
+    prompt = f"""You are examining a photo of a printed paper shopping list (which may contain both FOOD & GROCERIES and NON-FOOD / HOUSEHOLD sections).
 On this paper list:
 - Items that are CROSSED OUT (struck through with a pen/marker line) OR TICKED / CHECKED (inside or next to the `[ ]` box) have been PICKED UP / BOUGHT.
 - Items that are UNMARKED (neither crossed out nor ticked) were NOT picked up and are STILL NEEDED.
 
-Here are the current active items on the digital To-Do shopping list:
+Here are the current active items on the digital To-Do shopping lists (Food and Non-Food):
 {json.dumps(items_list, ensure_ascii=False)}
 
-Carefully inspect every line on the paper list in the image and match it against the digital To-Do list above.
+Carefully inspect every line on the paper list in the image and match it against the digital To-Do lists above.
 Return ONLY valid JSON with this exact structure:
 {{
   "bought_items": [
     {{
       "uid": "matching uid from digital list (or null if not in digital list)",
       "summary": "Item name from digital list",
+      "list_type": "food or non_food",
       "paper_text": "What was written on paper",
       "mark_type": "crossed_out or ticked"
     }}
@@ -356,7 +364,8 @@ Return ONLY valid JSON with this exact structure:
   "still_needed_items": [
     {{
       "uid": "matching uid from digital list",
-      "summary": "Item name from digital list"
+      "summary": "Item name from digital list",
+      "list_type": "food or non_food"
     }}
   ],
   "notes": "Brief 1-sentence summary of what was detected on the paper list"

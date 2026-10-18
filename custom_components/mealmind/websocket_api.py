@@ -93,14 +93,50 @@ async def _fetch_shopping_list(hass: HomeAssistant, store: MealMindStore) -> lis
                 "description": item.get("description", ""),
                 "status": item.get("status", "needs_action"),
                 "for_meals": for_meals,
+                "list_type": "food",
             }
         )
     return annotated
 
 
+async def _fetch_non_food_shopping_list(hass: HomeAssistant, store: MealMindStore) -> list[dict[str, Any]]:
+    """Fetch active items from the configured non-food todo shopping list."""
+    settings = store.get_settings()
+    non_food_entity = settings.get("non_food_todo_entity", "todo.non_food_shopping")
+    if not non_food_entity or not hass.states.get(non_food_entity):
+        return []
+
+    try:
+        res = await hass.services.async_call(
+            "todo",
+            "get_items",
+            {"status": ["needs_action"]},
+            target={"entity_id": [non_food_entity]},
+            blocking=True,
+            return_response=True,
+        )
+        items: list[dict[str, Any]] = res.get(non_food_entity, {}).get("items", [])
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Failed to fetch non-food shopping list from %s: %s", non_food_entity, err)
+        return []
+
+    return [
+        {
+            "uid": item.get("uid"),
+            "summary": (item.get("summary") or "").strip(),
+            "description": item.get("description", ""),
+            "status": item.get("status", "needs_action"),
+            "for_meals": [],
+            "list_type": "non_food",
+        }
+        for item in items
+    ]
+
+
 async def _build_full_state(hass: HomeAssistant, store: MealMindStore) -> dict[str, Any]:
     """Build full state payload for the frontend."""
     shopping_list = await _fetch_shopping_list(hass, store)
+    non_food_shopping_list = await _fetch_non_food_shopping_list(hass, store)
     return {
         "settings": store.get_settings(),
         "meals": store.get_meals(),
@@ -108,6 +144,7 @@ async def _build_full_state(hass: HomeAssistant, store: MealMindStore) -> dict[s
         "queue": store.get_queue(),
         "all_ingredients": store.get_all_ingredients(),
         "shopping_list": shopping_list,
+        "non_food_shopping_list": non_food_shopping_list,
     }
 
 
@@ -431,6 +468,7 @@ async def ws_queue_remove(
     {
         vol.Required("type"): "mealmind/shopping/add_items",
         vol.Required("items"): [str],
+        vol.Optional("list_type", default="food"): vol.In(["food", "non_food"]),
     }
 )
 @websocket_api.async_response
@@ -439,12 +477,18 @@ async def ws_shopping_add_items(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Add selected ingredients to the configured Todo shopping list."""
+    """Add selected items to either the Food or Non-Food Todo shopping list."""
     store, _ = _get_store_and_coord(hass)
     settings = store.get_settings()
-    todo_entity = settings.get("todo_entity", "todo.shopping_list")
+    list_type = msg.get("list_type", "food")
 
-    existing = await _fetch_shopping_list(hass, store)
+    if list_type == "non_food":
+        target_entity = settings.get("non_food_todo_entity", "todo.non_food_shopping")
+        existing = await _fetch_non_food_shopping_list(hass, store)
+    else:
+        target_entity = settings.get("todo_entity", "todo.shopping_list")
+        existing = await _fetch_shopping_list(hass, store)
+
     existing_lower = {item["summary"].strip().lower() for item in existing}
 
     added: list[str] = []
@@ -456,7 +500,7 @@ async def ws_shopping_add_items(
             "todo",
             "add_item",
             {"item": clean},
-            target={"entity_id": [todo_entity]},
+            target={"entity_id": [target_entity]},
             blocking=True,
         )
         existing_lower.add(clean.lower())
@@ -471,6 +515,7 @@ async def ws_shopping_add_items(
     {
         vol.Required("type"): "mealmind/shopping/complete_items",
         vol.Required("items"): [str],
+        vol.Optional("list_type", default="food"): vol.In(["food", "non_food"]),
     }
 )
 @websocket_api.async_response
@@ -479,10 +524,15 @@ async def ws_shopping_complete_items(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Mark one or more items (by uid or summary) as completed on the Todo shopping list."""
+    """Mark one or more items (by uid or summary) as completed on the Food or Non-Food Todo list."""
     store, _ = _get_store_and_coord(hass)
     settings = store.get_settings()
-    todo_entity = settings.get("todo_entity", "todo.shopping_list")
+    list_type = msg.get("list_type", "food")
+
+    if list_type == "non_food":
+        target_entity = settings.get("non_food_todo_entity", "todo.non_food_shopping")
+    else:
+        target_entity = settings.get("todo_entity", "todo.shopping_list")
 
     completed: list[str] = []
     for item_ref in msg["items"]:
@@ -493,12 +543,12 @@ async def ws_shopping_complete_items(
                 "todo",
                 "update_item",
                 {"item": item_ref, "status": "completed"},
-                target={"entity_id": [todo_entity]},
+                target={"entity_id": [target_entity]},
                 blocking=True,
             )
             completed.append(item_ref)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Failed to complete shopping list item '%s': %s", item_ref, err)
+            _LOGGER.warning("Failed to complete shopping list item '%s' on %s: %s", item_ref, target_entity, err)
 
     state = await _build_full_state(hass, store)
     state["completed_items"] = completed
@@ -556,18 +606,27 @@ async def ws_receipt_scan(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Scan a photo of a printed shopping list and mark crossed-out/ticked items completed."""
+    """Scan a photo of a printed shopping list and mark crossed-out/ticked items completed across Food and Non-Food lists."""
     store, _ = _get_store_and_coord(hass)
     settings = store.get_settings()
     todo_entity = settings.get("todo_entity", "todo.shopping_list")
-    shopping = await _fetch_shopping_list(hass, store)
+    non_food_entity = settings.get("non_food_todo_entity", "todo.non_food_shopping")
+
+    food_shopping = await _fetch_shopping_list(hass, store)
+    non_food_shopping = await _fetch_non_food_shopping_list(hass, store)
+    combined_shopping = food_shopping + non_food_shopping
+
+    non_food_uids = {item.get("uid") for item in non_food_shopping if item.get("uid")}
+    non_food_summaries_lower = {
+        (item.get("summary") or "").strip().lower() for item in non_food_shopping
+    }
 
     try:
         scan_result = await async_scan_receipt_photo(
             hass=hass,
             image_base64=msg["image_base64"],
             mime_type=msg.get("mime_type", "image/jpeg"),
-            shopping_items=shopping,
+            shopping_items=combined_shopping,
             settings=settings,
         )
 
@@ -575,18 +634,25 @@ async def ws_receipt_scan(
         if msg.get("auto_complete", True):
             for bought in scan_result.get("bought_items", []):
                 target_item = bought.get("uid") or bought.get("summary")
+                summary_str = (bought.get("summary") or "").strip()
                 if target_item:
+                    is_nf = (
+                        bought.get("list_type") == "non_food"
+                        or bought.get("uid") in non_food_uids
+                        or summary_str.lower() in non_food_summaries_lower
+                    )
+                    entity_to_update = non_food_entity if is_nf else todo_entity
                     try:
                         await hass.services.async_call(
                             "todo",
                             "update_item",
                             {"item": target_item, "status": "completed"},
-                            target={"entity_id": [todo_entity]},
+                            target={"entity_id": [entity_to_update]},
                             blocking=True,
                         )
-                        completed_summaries.append(bought.get("summary") or str(target_item))
+                        completed_summaries.append(summary_str or str(target_item))
                     except Exception as err:  # noqa: BLE001
-                        _LOGGER.debug("Could not mark '%s' completed: %s", target_item, err)
+                        _LOGGER.debug("Could not mark '%s' completed on %s: %s", target_item, entity_to_update, err)
 
         state = await _build_full_state(hass, store)
         state["scan_result"] = scan_result

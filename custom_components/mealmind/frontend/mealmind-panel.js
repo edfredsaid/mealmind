@@ -26,6 +26,10 @@ class MealMindPanel extends HTMLElement {
     // 'list' | 'meals' | 'scan'
     this._shopSubView = "list";
 
+    // Food vs Non-Food Shopping List category switcher:
+    // 'food' | 'non_food' | 'both'
+    this._shopListCategory = "food";
+
     // Calendar window state
     this._dayOffset = 0;
     this._numDaysView = 14;
@@ -39,6 +43,7 @@ class MealMindPanel extends HTMLElement {
         dislikes: ["feta", "beetroot"],
         custom_preferences: "",
         todo_entity: "todo.shopping_list",
+        non_food_todo_entity: "todo.non_food_shopping",
         printer_entity: "notify.hall_stairs_hallway_receipt_printer",
       },
       meals: {},
@@ -46,6 +51,7 @@ class MealMindPanel extends HTMLElement {
       queue: [],
       all_ingredients: [],
       shopping_list: [],
+      non_food_shopping_list: [],
     };
 
     // Modals
@@ -115,6 +121,7 @@ class MealMindPanel extends HTMLElement {
     if (res.queue) this._state.queue = res.queue;
     if (res.all_ingredients) this._state.all_ingredients = res.all_ingredients;
     if (res.shopping_list) this._state.shopping_list = res.shopping_list;
+    if (res.non_food_shopping_list) this._state.non_food_shopping_list = res.non_food_shopping_list;
     this._render();
   }
 
@@ -732,11 +739,12 @@ class MealMindPanel extends HTMLElement {
   // Shopping List Actions & Pop-Out Window
   // ---------------------------------------------------------------------------
 
-  async _completeShoppingItem(uidOrSummary) {
+  async _completeShoppingItem(uidOrSummary, listType = "food") {
     try {
       const res = await this._wsCall({
         type: "mealmind/shopping/complete_items",
         items: [uidOrSummary],
+        list_type: listType || "food",
       });
       this._updateLocalState(res);
     } catch (err) {
@@ -744,14 +752,18 @@ class MealMindPanel extends HTMLElement {
     }
   }
 
-  async _addSingleShoppingItem(itemText) {
+  async _addSingleShoppingItem(itemText, listType = "food") {
     if (!itemText || !itemText.trim()) return;
     try {
       const res = await this._wsCall({
         type: "mealmind/shopping/add_items",
         items: [itemText.trim()],
+        list_type: listType || "food",
       });
       this._updateLocalState(res);
+      this._showToast(
+        `Added '${itemText.trim()}' to ${listType === "non_food" ? "Non-Food" : "Food"} list!`
+      );
     } catch (err) {
       this._showToast("Failed to add item: " + (err.message || err), true);
     }
@@ -1255,14 +1267,58 @@ class MealMindPanel extends HTMLElement {
     `;
   }
 
+  _renderShoppingItemRow(item, listType = "food", showCategoryBadge = false) {
+    const lt = item.list_type || listType || "food";
+    return `
+      <div class="shop-item-row">
+        <label class="shop-item-label">
+          <input type="checkbox" class="modern-checkbox shop-check"
+                 data-uid="${this._escapeHtml(item.uid || item.summary)}"
+                 data-list-type="${this._escapeHtml(lt)}" />
+          <div class="shop-item-text">
+            <div class="shop-item-name">
+              ${this._escapeHtml(item.summary)}
+              ${
+                showCategoryBadge
+                  ? lt === "non_food"
+                    ? `<span class="badge badge-warn" style="margin-left:6px; font-size:11px;">🧻 Non-Food</span>`
+                    : `<span class="badge badge-ok" style="margin-left:6px; font-size:11px;">🍎 Food</span>`
+                  : ""
+              }
+            </div>
+            ${
+              (item.for_meals || []).length > 0
+                ? `<div class="shop-item-meals">🍲 For: ${this._escapeHtml(item.for_meals.join(", "))}</div>`
+                : ""
+            }
+          </div>
+        </label>
+        <button class="icon-btn copy-shop-btn" data-text="${this._escapeHtml(item.summary)}" title="Copy item for online supermarket search">
+          📋
+        </button>
+      </div>
+    `;
+  }
+
   _renderShoppingAndScanTab() {
-    const items = this._state.shopping_list || [];
+    const foodItems = this._state.shopping_list || [];
+    const nonFoodItems = this._state.non_food_shopping_list || [];
+    const totalShopCount = foodItems.length + nonFoodItems.length;
+
     const today = this._todayStr();
     let upcomingCount = 0;
     for (let i = 0; i < 10; i++) {
       const slot = this._state.schedule[this._addDaysStr(today, i)];
       if (slot && !slot.skipped && (slot.meal_id || slot.meal_name)) upcomingCount++;
     }
+
+    const cat = this._shopListCategory || "food";
+    const activeEntityLabel =
+      cat === "non_food"
+        ? this._state.settings.non_food_todo_entity || "todo.non_food_shopping"
+        : cat === "food"
+        ? this._state.settings.todo_entity || "todo.shopping_list"
+        : `${this._state.settings.todo_entity || "todo.shopping_list"} + ${this._state.settings.non_food_todo_entity || "todo.non_food_shopping"}`;
 
     return `
       <!-- Top Action Hero Bar: Always visible at the very top of Shop & Scan (never buried under lists!) -->
@@ -1289,8 +1345,8 @@ class MealMindPanel extends HTMLElement {
                 </button>`
               : ""
           }
-          <button class="btn btn-secondary" id="print-shop-btn">
-            🖨️ Print Paper List
+          <button class="btn btn-secondary" id="print-shop-btn" title="Prints both Food and Non-Food sections on your receipt printer">
+            🖨️ Print Paper List (Food & Non-Food)
           </button>
         </div>
       </div>
@@ -1298,7 +1354,7 @@ class MealMindPanel extends HTMLElement {
       <!-- Segmented Sub-View Switcher (especially fast on mobile so you never scroll past 40 items) -->
       <div class="segmented-control">
         <button class="seg-btn ${this._shopSubView === "list" ? "active" : ""}" data-subview="list">
-          🛒 To-Buy List (${items.length})
+          🛒 Shopping Lists (${totalShopCount})
         </button>
         <button class="seg-btn ${this._shopSubView === "meals" ? "active" : ""}" data-subview="meals">
           📅 Planned Meals & Expiry (${upcomingCount})
@@ -1318,46 +1374,98 @@ class MealMindPanel extends HTMLElement {
           <div class="surface-card">
             <div class="section-header" style="margin-bottom: 12px;">
               <div>
-                <h3 class="section-title">🛒 Shopping List (${items.length})</h3>
-                <p class="section-subtitle">Tap any item to tick it off in <code>${this._escapeHtml(this._state.settings.todo_entity)}</code></p>
+                <h3 class="section-title">🛒 Shopping Lists</h3>
+                <p class="section-subtitle">Synced live with <code>${this._escapeHtml(activeEntityLabel)}</code></p>
               </div>
             </div>
 
-            <div class="quick-input-bar">
-              <input type="text" id="quick-shop-item-input" class="input" style="flex:1;" placeholder="Add item to shopping list (e.g. Oat Milk, Courgettes)..." />
-              <button class="btn btn-primary" id="quick-shop-item-btn">＋ Add</button>
+            <!-- Food vs Non-Food Category Switcher -->
+            <div class="segmented-control" style="margin-bottom: 14px;">
+              <button class="seg-btn shop-cat-btn ${cat === "food" ? "active" : ""}" data-cat="food">
+                🍎 Food & Groceries (${foodItems.length})
+              </button>
+              <button class="seg-btn shop-cat-btn ${cat === "non_food" ? "active" : ""}" data-cat="non_food">
+                🧻 Non-Food (${nonFoodItems.length})
+              </button>
+              <button class="seg-btn shop-cat-btn ${cat === "both" ? "active" : ""}" data-cat="both">
+                📋 Both (${totalShopCount})
+              </button>
             </div>
 
+            <!-- Quick Add Bar -->
+            <div class="quick-input-bar" style="flex-wrap:wrap;">
+              <input type="text" id="quick-shop-item-input" class="input" style="flex:1; min-width:200px;"
+                     placeholder="${
+                       cat === "non_food"
+                         ? "Add non-food item (e.g. Toothpaste, Kitchen Roll, Bin Bags)..."
+                         : cat === "food"
+                         ? "Add food item (e.g. Oat Milk, Courgettes, Halloumi)..."
+                         : "Add item to Food or Non-Food list..."
+                     }" />
+              ${
+                cat === "both"
+                  ? `
+                    <button class="btn btn-primary" id="quick-shop-add-food-btn">＋ 🍎 Food</button>
+                    <button class="btn btn-secondary" id="quick-shop-add-nf-btn">＋ 🧻 Non-Food</button>
+                  `
+                  : `
+                    <button class="btn btn-primary" id="quick-shop-item-btn">
+                      ＋ Add to ${cat === "non_food" ? "Non-Food" : "Food"}
+                    </button>
+                  `
+              }
+            </div>
+
+            <!-- List Content -->
             ${
-              items.length === 0
+              cat === "food"
+                ? foodItems.length === 0
+                  ? `<div class="empty-state" style="margin-top:14px;">
+                      <div class="empty-icon">🍎</div>
+                      <div>Your Food & Groceries shopping list is clear!</div>
+                    </div>`
+                  : `<div class="shop-checklist" style="margin-top: 14px;">
+                      ${foodItems.map((item) => this._renderShoppingItemRow(item, "food", false)).join("")}
+                    </div>`
+                : cat === "non_food"
+                ? nonFoodItems.length === 0
+                  ? `<div class="empty-state" style="margin-top:14px;">
+                      <div class="empty-icon">🧻</div>
+                      <div>Your Non-Food & Household shopping list is clear!</div>
+                    </div>`
+                  : `<div class="shop-checklist" style="margin-top: 14px;">
+                      ${nonFoodItems.map((item) => this._renderShoppingItemRow(item, "non_food", false)).join("")}
+                    </div>`
+                : totalShopCount === 0
                 ? `<div class="empty-state" style="margin-top:14px;">
                     <div class="empty-icon">🎉</div>
-                    <div>Your shopping list is completely clear!</div>
+                    <div>Both your Food and Non-Food shopping lists are completely clear!</div>
                   </div>`
-                : `<div class="shop-checklist" style="margin-top: 14px;">
-                    ${items
-                      .map(
-                        (item) => `
-                        <div class="shop-item-row">
-                          <label class="shop-item-label">
-                            <input type="checkbox" class="modern-checkbox shop-check" data-uid="${this._escapeHtml(item.uid || item.summary)}" />
-                            <div class="shop-item-text">
-                              <div class="shop-item-name">${this._escapeHtml(item.summary)}</div>
-                              ${
-                                (item.for_meals || []).length > 0
-                                  ? `<div class="shop-item-meals">🍲 For: ${this._escapeHtml(item.for_meals.join(", "))}</div>`
-                                  : ""
-                              }
-                            </div>
-                          </label>
-                          <button class="icon-btn copy-shop-btn" data-text="${this._escapeHtml(item.summary)}" title="Copy item for online supermarket search">
-                            📋
-                          </button>
-                        </div>
-                      `
-                      )
-                      .join("")}
-                  </div>`
+                : `
+                  <div style="margin-top: 16px;">
+                    <div class="day-eyebrow" style="margin-bottom: 8px; color: #4ade80;">
+                      🍎 FOOD & GROCERIES (${foodItems.length})
+                    </div>
+                    ${
+                      foodItems.length === 0
+                        ? `<div class="section-subtitle" style="margin-bottom: 14px;">No food items needed.</div>`
+                        : `<div class="shop-checklist" style="margin-bottom: 18px;">
+                            ${foodItems.map((item) => this._renderShoppingItemRow(item, "food", false)).join("")}
+                          </div>`
+                    }
+
+                    <div class="day-eyebrow" style="margin-bottom: 8px; color: #fbbf24;">
+                      🧻 NON-FOOD & HOUSEHOLD (${nonFoodItems.length})
+                    </div>
+                    ${
+                      nonFoodItems.length === 0
+                        ? `<div class="section-subtitle">No non-food items needed.</div>`
+                        : `<div class="shop-checklist">
+                            ${nonFoodItems.map((item) => this._renderShoppingItemRow(item, "non_food", false)).join("")}
+                          </div>`
+                    }
+                  </div>
+                `
             }
           </div>
         </div>
@@ -1370,7 +1478,7 @@ class MealMindPanel extends HTMLElement {
                   <div class="section-header">
                     <div>
                       <h3 class="section-title">📸 Latest Receipt Photo Scan</h3>
-                      <p class="section-subtitle">${this._escapeHtml(this._scanSummary.notes || "Synced with your To-Do shopping list")}</p>
+                      <p class="section-subtitle">${this._escapeHtml(this._scanSummary.notes || "Synced with your Food & Non-Food To-Do lists")}</p>
                     </div>
                     <button class="btn btn-secondary btn-sm" id="reopen-scan-modal-btn">Expand</button>
                   </div>
@@ -1432,12 +1540,18 @@ class MealMindPanel extends HTMLElement {
           <label>General Household Meal Preferences (used by AI Chef)</label>
           <textarea id="pref-custom" class="input" rows="3" placeholder="e.g. Prefer 30-minute mid-week dinners, love Mexican, Italian, and Thai flavours...">${this._escapeHtml(s.custom_preferences || "")}</textarea>
         </div>
-        <div class="form-group">
-          <label>Shopping List To-Do Entity</label>
-          <input type="text" id="pref-todo" class="input" value="${this._escapeHtml(s.todo_entity || "todo.shopping_list")}" />
+        <div class="form-row-2col">
+          <div class="form-group">
+            <label>🍎 Food Shopping To-Do Entity</label>
+            <input type="text" id="pref-todo" class="input" value="${this._escapeHtml(s.todo_entity || "todo.shopping_list")}" />
+          </div>
+          <div class="form-group">
+            <label>🧻 Non-Food Shopping To-Do Entity</label>
+            <input type="text" id="pref-non-food-todo" class="input" value="${this._escapeHtml(s.non_food_todo_entity || "todo.non_food_shopping")}" />
+          </div>
         </div>
         <div class="form-group">
-          <label>ESC/POS Receipt Printer Notify Entity</label>
+          <label>🖨️ ESC/POS Receipt Printer Notify Entity</label>
           <input type="text" id="pref-printer" class="input" value="${this._escapeHtml(s.printer_entity || "notify.hall_stairs_hallway_receipt_printer")}" />
         </div>
         <div style="margin-top: 18px;">
@@ -1852,7 +1966,9 @@ class MealMindPanel extends HTMLElement {
     `;
 
     const mealCount = Object.keys(this._state.meals || {}).length;
-    const shopCount = (this._state.shopping_list || []).length;
+    const shopCount =
+      (this._state.shopping_list || []).length +
+      (this._state.non_food_shopping_list || []).length;
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -3293,16 +3409,44 @@ class MealMindPanel extends HTMLElement {
       };
     }
 
+    // Food vs Non-Food Category switcher
+    root.querySelectorAll(".shop-cat-btn").forEach((btn) => {
+      btn.onclick = () => {
+        this._shopListCategory = btn.dataset.cat || "food";
+        this._render();
+      };
+    });
+
     const quickShopInput = root.getElementById("quick-shop-item-input");
     const quickShopBtn = root.getElementById("quick-shop-item-btn");
+    const quickAddFoodBtn = root.getElementById("quick-shop-add-food-btn");
+    const quickAddNfBtn = root.getElementById("quick-shop-add-nf-btn");
+
+    const targetListType =
+      this._shopListCategory === "non_food" ? "non_food" : "food";
+
     if (quickShopBtn && quickShopInput) {
       quickShopBtn.onclick = () => {
-        this._addSingleShoppingItem(quickShopInput.value);
+        this._addSingleShoppingItem(quickShopInput.value, targetListType);
         quickShopInput.value = "";
       };
+    }
+    if (quickAddFoodBtn && quickShopInput) {
+      quickAddFoodBtn.onclick = () => {
+        this._addSingleShoppingItem(quickShopInput.value, "food");
+        quickShopInput.value = "";
+      };
+    }
+    if (quickAddNfBtn && quickShopInput) {
+      quickAddNfBtn.onclick = () => {
+        this._addSingleShoppingItem(quickShopInput.value, "non_food");
+        quickShopInput.value = "";
+      };
+    }
+    if (quickShopInput) {
       quickShopInput.onkeydown = (e) => {
         if (e.key === "Enter") {
-          this._addSingleShoppingItem(quickShopInput.value);
+          this._addSingleShoppingItem(quickShopInput.value, targetListType);
           quickShopInput.value = "";
         }
       };
@@ -3311,7 +3455,7 @@ class MealMindPanel extends HTMLElement {
     root.querySelectorAll(".shop-check").forEach((chk) => {
       chk.onchange = () => {
         if (chk.checked) {
-          this._completeShoppingItem(chk.dataset.uid);
+          this._completeShoppingItem(chk.dataset.uid, chk.dataset.listType || "food");
         }
       };
     });
@@ -3344,6 +3488,8 @@ class MealMindPanel extends HTMLElement {
           .filter(Boolean);
         const custom = root.getElementById("pref-custom").value.trim();
         const todo = root.getElementById("pref-todo").value.trim();
+        const nfTodoEl = root.getElementById("pref-non-food-todo");
+        const nfTodo = nfTodoEl ? nfTodoEl.value.trim() : "todo.non_food_shopping";
         const printer = root.getElementById("pref-printer").value.trim();
 
         const res = await this._wsCall({
@@ -3353,6 +3499,7 @@ class MealMindPanel extends HTMLElement {
             dislikes,
             custom_preferences: custom,
             todo_entity: todo,
+            non_food_todo_entity: nfTodo,
             printer_entity: printer,
           },
         });

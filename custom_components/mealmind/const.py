@@ -5,7 +5,7 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "mealmind"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 PLATFORMS: list[Platform] = [
     Platform.CALENDAR,
@@ -16,12 +16,14 @@ STORAGE_KEY = "mealmind"
 STORAGE_VERSION = 1
 
 DEFAULT_TODO_ENTITY = "todo.shopping_list"
+DEFAULT_NON_FOOD_TODO_ENTITY = "todo.non_food_shopping"
 DEFAULT_PRINTER_ENTITY = "notify.hall_stairs_hallway_receipt_printer"
 DEFAULT_AI_CONVERSATION_ENTITY = "conversation.google_generative_ai"
 DEFAULT_AI_TASK_ENTITY = "ai_task.google_ai_task"
 
 DEFAULT_SETTINGS: dict = {
     "todo_entity": DEFAULT_TODO_ENTITY,
+    "non_food_todo_entity": DEFAULT_NON_FOOD_TODO_ENTITY,
     "printer_entity": DEFAULT_PRINTER_ENTITY,
     "ai_conversation_entity": DEFAULT_AI_CONVERSATION_ENTITY,
     "ai_task_entity": DEFAULT_AI_TASK_ENTITY,
