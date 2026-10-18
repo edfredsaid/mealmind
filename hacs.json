@@ -1,0 +1,5 @@
+{
+  "name": "MealMind: Smart Meal Planner",
+  "render_readme": true,
+  "homeassistant": "2025.1.0"
+}

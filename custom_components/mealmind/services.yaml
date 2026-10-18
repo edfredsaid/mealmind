@@ -1,0 +1,88 @@
+print_today_card:
+  name: Print Today's Meal Card
+  description: Print today's meal card (with ingredients, shortest expiry date, and notes) on the ESC/POS receipt printer.
+  fields:
+    date:
+      name: Date
+      description: Optional YYYY-MM-DD date to print (defaults to today).
+      required: false
+      example: "2026-10-18"
+      selector:
+        text:
+
+print_next_7_days:
+  name: Print Next 7 Days Meal Plan
+  description: Print a rolling 7-day meal schedule on the ESC/POS receipt printer.
+  fields:
+    start_date:
+      name: Start Date
+      description: Optional YYYY-MM-DD start date (defaults to today).
+      required: false
+      example: "2026-10-18"
+      selector:
+        text:
+
+print_shopping_list:
+  name: Print Shopping List
+  description: Print active items from the shopping list formatted with checkboxes for pen cross-out and receipt scanning.
+
+auto_schedule:
+  name: Auto-Schedule Meals by Expiry
+  description: Automatically order unpinned meals and queue items so meals with the earliest ingredient expiry date are cooked first.
+  fields:
+    start_date:
+      name: Start Date
+      description: Optional YYYY-MM-DD start date (defaults to today).
+      required: false
+      selector:
+        text:
+    num_days:
+      name: Number of Days
+      description: Number of days in the scheduling window.
+      default: 14
+      selector:
+        number:
+          min: 1
+          max: 30
+
+push_day:
+  name: Push Meal Forward
+  description: Push a day's meal forward by N days and cascade subsequent unpinned meals.
+  fields:
+    date:
+      name: Date
+      description: YYYY-MM-DD date to push.
+      required: true
+      selector:
+        text:
+    days:
+      name: Days
+      description: Number of open days to push forward.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 14
+
+skip_day:
+  name: Skip Day
+  description: Mark a day as skipped and push its meal forward into the next open slot.
+  fields:
+    date:
+      name: Date
+      description: YYYY-MM-DD date to skip.
+      required: true
+      selector:
+        text:
+    skip_reason:
+      name: Reason
+      description: Optional reason (e.g. Eating Out, Leftovers).
+      default: "Skipped"
+      selector:
+        text:
+    push_existing:
+      name: Push Existing Meal
+      description: Push any meal currently on this date forward.
+      default: true
+      selector:
+        boolean:

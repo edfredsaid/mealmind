@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up MealMind",
+        "description": "Configure your smart meal planner, shopping list, ESC/POS receipt printer, and default dietary profile.",
+        "data": {
+          "todo_entity": "Shopping List To-Do Entity",
+          "printer_entity": "ESC/POS Printer Notify Entity",
+          "dietary_profile": "Default Dietary Profile",
+          "dislikes": "Default Disliked / Excluded Ingredients (comma-separated)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "MealMind is already configured."
+    }
+  }
+}

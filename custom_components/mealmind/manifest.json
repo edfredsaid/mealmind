@@ -1,0 +1,12 @@
+{
+  "domain": "mealmind",
+  "name": "MealMind",
+  "codeowners": ["@edfredsaid"],
+  "config_flow": true,
+  "dependencies": ["frontend", "http", "todo"],
+  "documentation": "https://github.com/edfredsaid/mealmind",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/edfredsaid/mealmind/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}
