@@ -11,7 +11,11 @@ import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
 
-from .ai_helper import async_scan_receipt_photo, async_suggest_meals
+from .ai_helper import (
+    async_scan_receipt_photo,
+    async_scan_recipe_card,
+    async_suggest_meals,
+)
 from .const import DOMAIN
 from .coordinator import MealMindCoordinator
 from .printer_helper import (
@@ -173,6 +177,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_shopping_complete_items)
     websocket_api.async_register_command(hass, ws_ai_suggest)
     websocket_api.async_register_command(hass, ws_receipt_scan)
+    websocket_api.async_register_command(hass, ws_scan_recipe_card)
     websocket_api.async_register_command(hass, ws_printer_print)
 
 
@@ -666,6 +671,40 @@ async def ws_receipt_scan(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): "mealmind/meals/scan_recipe_card",
+        vol.Optional("front_image_base64"): vol.Any(str, None),
+        vol.Optional("back_image_base64"): vol.Any(str, None),
+        vol.Optional("front_mime_type", default="image/jpeg"): str,
+        vol.Optional("back_mime_type", default="image/jpeg"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_scan_recipe_card(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Scan front and/or back photos of a recipe card and return an adapted meal dictionary."""
+    store, _ = _get_store_and_coord(hass)
+    settings = store.get_settings()
+
+    try:
+        card_result = await async_scan_recipe_card(
+            hass=hass,
+            front_image_base64=msg.get("front_image_base64"),
+            back_image_base64=msg.get("back_image_base64"),
+            settings=settings,
+            front_mime_type=msg.get("front_mime_type", "image/jpeg"),
+            back_mime_type=msg.get("back_mime_type", "image/jpeg"),
+        )
+        connection.send_result(msg["id"], {"recipe_card": card_result})
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("MealMind recipe card scan failed")
+        connection.send_error(msg["id"], "recipe_scan_error", str(err))
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): "mealmind/printer/print",
         vol.Required("mission"): vol.In(
             ["today_card", "next_7_days", "next_7_days_cards", "shopping_list"]
@@ -700,3 +739,4 @@ async def ws_printer_print(
     except Exception as err:  # noqa: BLE001
         _LOGGER.exception("MealMind printer mission '%s' failed", mission)
         connection.send_error(msg["id"], "print_error", str(err))
+

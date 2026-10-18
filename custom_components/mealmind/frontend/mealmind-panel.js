@@ -605,7 +605,7 @@ class MealMindPanel extends HTMLElement {
   // Meal Database Modal & Actions
   // ---------------------------------------------------------------------------
 
-  _openMealModal(meal = null) {
+  _openMealModal(meal = null, startWithScanner = false) {
     this._closeAllMenus();
     if (meal) {
       this._mealModal = {
@@ -617,6 +617,14 @@ class MealMindPanel extends HTMLElement {
         newTag: "",
         notes: meal.notes || "",
         favourite: Boolean(meal.favourite),
+        showCardScanner: Boolean(startWithScanner),
+        cardFrontDataUrl: null,
+        cardFrontMime: "image/jpeg",
+        cardBackDataUrl: null,
+        cardBackMime: "image/jpeg",
+        cardScanLoading: false,
+        substitutionsMade: [],
+        originalCardName: "",
       };
     } else {
       this._mealModal = {
@@ -628,9 +636,83 @@ class MealMindPanel extends HTMLElement {
         newTag: "",
         notes: "",
         favourite: false,
+        showCardScanner: Boolean(startWithScanner),
+        cardFrontDataUrl: null,
+        cardFrontMime: "image/jpeg",
+        cardBackDataUrl: null,
+        cardBackMime: "image/jpeg",
+        cardScanLoading: false,
+        substitutionsMade: [],
+        originalCardName: "",
       };
     }
     this._render();
+  }
+
+  async _handleRecipeCardPhotoSelect(side, event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file || !this._mealModal) return;
+    try {
+      const { dataUrl, mimeType } = await this._compressImageFile(file);
+      if (side === "front") {
+        this._mealModal.cardFrontDataUrl = dataUrl;
+        this._mealModal.cardFrontMime = mimeType;
+      } else {
+        this._mealModal.cardBackDataUrl = dataUrl;
+        this._mealModal.cardBackMime = mimeType;
+      }
+      this._render();
+    } catch (err) {
+      this._showToast("Could not read photo: " + (err.message || err), true);
+    }
+  }
+
+  async _runRecipeCardScan() {
+    if (!this._mealModal) return;
+    const m = this._mealModal;
+    if (!m.cardFrontDataUrl && !m.cardBackDataUrl) {
+      this._showToast("Please take or select at least one photo (front or back) of the recipe card.", true);
+      return;
+    }
+    m.cardScanLoading = true;
+    this._render();
+
+    try {
+      const res = await this._wsCall({
+        type: "mealmind/meals/scan_recipe_card",
+        front_image_base64: m.cardFrontDataUrl,
+        back_image_base64: m.cardBackDataUrl,
+        front_mime_type: m.cardFrontMime || "image/jpeg",
+        back_mime_type: m.cardBackMime || "image/jpeg",
+      });
+      const card = (res && res.recipe_card) || {};
+      m.cardScanLoading = false;
+      if (card.name) {
+        m.name = card.name;
+      }
+      if (Array.isArray(card.ingredients) && card.ingredients.length > 0) {
+        m.ingredients = card.ingredients;
+      }
+      if (Array.isArray(card.tags) && card.tags.length > 0) {
+        m.tags = card.tags;
+      }
+      m.substitutionsMade = Array.isArray(card.substitutions_made)
+        ? card.substitutions_made
+        : [];
+      m.originalCardName = card.original_name || "";
+      this._render();
+
+      const subCount = m.substitutionsMade.length;
+      this._showToast(
+        subCount > 0
+          ? `✨ Extracted '${m.name}' with ${subCount} dietary/preference substitution(s)!`
+          : `✨ Extracted '${m.name}' (${m.ingredients.length} ingredients)!`
+      );
+    } catch (err) {
+      m.cardScanLoading = false;
+      this._render();
+      this._showToast("Recipe card scan failed: " + (err.message || err), true);
+    }
   }
 
   async _saveMealModal() {
@@ -1246,7 +1328,14 @@ class MealMindPanel extends HTMLElement {
             )
             .join("")}
         </div>
-        <button class="btn btn-emerald" id="new-db-meal-btn">＋ New Saved Meal</button>
+        <div class="action-cluster">
+          <button class="btn btn-violet" id="scan-recipe-card-btn" title="Scan front & back of a recipe card and adapt ingredients to your dietary preferences">
+            📷 Scan Recipe Card
+          </button>
+          <button class="btn btn-emerald" id="new-db-meal-btn">
+            ＋ New Saved Meal
+          </button>
+        </div>
       </div>
 
       <div class="db-grid">
@@ -1943,16 +2032,123 @@ class MealMindPanel extends HTMLElement {
       `;
     }
 
-    // 2. Meal Database Create/Edit Modal
+    // 2. Meal Database Create/Edit Modal (with Front & Back AI Recipe Card Scanner!)
     if (this._mealModal) {
       const m = this._mealModal;
+      const s = this._state.settings || {};
+      const diet = s.dietary_profile || "Vegetarian";
+      const dislikesStr = Array.isArray(s.dislikes) ? s.dislikes.join(", ") : s.dislikes || "";
+
       html += `
         <div class="modal-backdrop">
-          <div class="modal-sheet">
+          <div class="modal-sheet modal-sheet-lg">
             <div class="modal-header">
-              <h3 class="modal-title">${m.id ? "✎ Edit Saved Meal" : "＋ Add Meal to Database"}</h3>
-              <button class="icon-btn" id="meal-modal-close">✕</button>
+              <div>
+                <div class="day-eyebrow">SAVED MEAL DATABASE</div>
+                <h3 class="modal-title">${m.id ? "✎ Edit Saved Meal" : "🍲 Add Saved Meal"}</h3>
+              </div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <button class="btn ${m.showCardScanner ? "btn-secondary" : "btn-violet"} btn-sm" id="toggle-card-scanner-btn">
+                  📷 ${m.showCardScanner ? "Hide Card Scanner" : "Scan Recipe Card"}
+                </button>
+                <button class="icon-btn" id="meal-modal-close">✕</button>
+              </div>
             </div>
+
+            ${
+              m.showCardScanner
+                ? `
+                  <div class="recipe-scanner-box">
+                    <div class="recipe-scanner-header">
+                      <div>
+                        <div style="font-weight:800; font-size:14.5px; color:#f8fafc;">
+                          📷 AI Recipe Card Scanner (Front & Back)
+                        </div>
+                        <div class="section-subtitle">
+                          Snap the front and/or back of a recipe card. AI extracts the meal name & ingredients (ignoring cooking steps) and automatically adapts for <strong>${this._escapeHtml(diet)}</strong>${dislikesStr ? ` & substitutes <strong>${this._escapeHtml(dislikesStr)}</strong>` : ""}.
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="recipe-card-slots">
+                      <label class="recipe-photo-slot ${m.cardFrontDataUrl ? "has-photo" : ""}">
+                        <input type="file" accept="image/*" capture="environment" id="recipe-card-front-input" style="display:none;" />
+                        ${
+                          m.cardFrontDataUrl
+                            ? `
+                              <img src="${m.cardFrontDataUrl}" class="recipe-thumb" alt="Front of card" />
+                              <div class="recipe-slot-info">
+                                <span class="badge badge-ok">✓ Front Ready</span>
+                                <span class="section-subtitle">Tap to retake front</span>
+                              </div>
+                            `
+                            : `
+                              <div class="recipe-slot-icon">📸</div>
+                              <div class="recipe-slot-info">
+                                <div style="font-weight:700; color:#f8fafc;">1. Front of Card</div>
+                                <div class="section-subtitle">Title / Dish side</div>
+                              </div>
+                            `
+                        }
+                      </label>
+
+                      <label class="recipe-photo-slot ${m.cardBackDataUrl ? "has-photo" : ""}">
+                        <input type="file" accept="image/*" capture="environment" id="recipe-card-back-input" style="display:none;" />
+                        ${
+                          m.cardBackDataUrl
+                            ? `
+                              <img src="${m.cardBackDataUrl}" class="recipe-thumb" alt="Back of card" />
+                              <div class="recipe-slot-info">
+                                <span class="badge badge-ok">✓ Back Ready</span>
+                                <span class="section-subtitle">Tap to retake back</span>
+                              </div>
+                            `
+                            : `
+                              <div class="recipe-slot-icon">📋</div>
+                              <div class="recipe-slot-info">
+                                <div style="font-weight:700; color:#f8fafc;">2. Back of Card</div>
+                                <div class="section-subtitle">Ingredients list side</div>
+                              </div>
+                            `
+                        }
+                      </label>
+                    </div>
+
+                    <button class="btn btn-violet btn-block" id="run-recipe-card-scan-btn"
+                            style="width:100%; margin-top:10px;"
+                            ${m.cardScanLoading || (!m.cardFrontDataUrl && !m.cardBackDataUrl) ? "disabled" : ""}>
+                      ${
+                        m.cardScanLoading
+                          ? "⏳ AI Reading Card & Adapting Ingredients..."
+                          : "✨ Extract Meal & Adapt Ingredients with AI"
+                      }
+                    </button>
+                  </div>
+                `
+                : ""
+            }
+
+            ${
+              (m.substitutionsMade || []).length > 0
+                ? `
+                  <div class="substitutions-banner">
+                    <div class="day-eyebrow" style="color:#a78bfa; margin-bottom:4px;">
+                      ✨ DIETARY & PREFERENCE SUBSTITUTIONS APPLIED
+                    </div>
+                    ${
+                      m.originalCardName && m.originalCardName !== m.name
+                        ? `<div style="font-size:12px; color:#cbd5e1; margin-bottom:4px;">Adapted from card title: <em>${this._escapeHtml(m.originalCardName)}</em></div>`
+                        : ""
+                    }
+                    <ul class="sub-list">
+                      ${m.substitutionsMade
+                        .map((sub) => `<li>🔄 ${this._escapeHtml(sub)}</li>`)
+                        .join("")}
+                    </ul>
+                  </div>
+                `
+                : ""
+            }
 
             <div class="form-group" style="margin-top:12px;">
               <label>Meal Name</label>
@@ -1960,18 +2156,22 @@ class MealMindPanel extends HTMLElement {
             </div>
 
             <div class="form-group">
-              <label>Ingredients</label>
+              <label>Ingredients (${m.ingredients.length})</label>
               <div class="pill-row" style="margin-bottom:8px;">
-                ${m.ingredients
-                  .map(
-                    (ing, idx) => `
-                    <span class="pill pill-lg">
-                      ${this._escapeHtml(ing)}
-                      <button class="pill-del meal-ing-del" data-idx="${idx}">✕</button>
-                    </span>
-                  `
-                  )
-                  .join("")}
+                ${
+                  m.ingredients.length === 0
+                    ? `<span class="section-subtitle">Scan a recipe card above or type ingredients below</span>`
+                    : m.ingredients
+                        .map(
+                          (ing, idx) => `
+                          <span class="pill pill-lg">
+                            ${this._escapeHtml(ing)}
+                            <button class="pill-del meal-ing-del" data-idx="${idx}">✕</button>
+                          </span>
+                        `
+                        )
+                        .join("")
+                }
               </div>
               <div class="quick-input-bar">
                 <input type="text" id="meal-modal-new-ing" class="input" list="all-ings-datalist" style="flex:1;" placeholder="Add ingredient(s), comma-separated..." value="${this._escapeHtml(m.newIngredient || "")}" />
@@ -2000,8 +2200,8 @@ class MealMindPanel extends HTMLElement {
             </div>
 
             <div class="form-group">
-              <label>Prep / Recipe Notes</label>
-              <textarea id="meal-modal-notes" class="input" rows="2">${this._escapeHtml(m.notes)}</textarea>
+              <label>Optional Prep / Serving Note</label>
+              <textarea id="meal-modal-notes" class="input" rows="2" placeholder="Optional note (cooking steps not required)...">${this._escapeHtml(m.notes)}</textarea>
             </div>
 
             <label class="toggle-row" style="margin: 14px 0;">
@@ -2011,7 +2211,7 @@ class MealMindPanel extends HTMLElement {
 
             <div class="modal-footer">
               <button class="btn btn-secondary" id="meal-modal-cancel">Cancel</button>
-              <button class="btn btn-emerald btn-lg" id="meal-modal-save">💾 Save to Database</button>
+              <button class="btn btn-emerald btn-lg" id="meal-modal-save">💾 Save to Saved Meals</button>
             </div>
           </div>
         </div>
@@ -3416,6 +3616,83 @@ class MealMindPanel extends HTMLElement {
           background: #0f172a;
           border: 1px solid var(--mm-border);
         }
+
+        /* Recipe Card Scanner (Front & Back) */
+        .recipe-scanner-box {
+          margin-top: 12px;
+          padding: 14px;
+          border-radius: 14px;
+          background: rgba(124, 58, 237, 0.12);
+          border: 1px solid rgba(167, 139, 250, 0.35);
+        }
+        .recipe-card-slots {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 10px;
+          margin-top: 12px;
+        }
+        .recipe-photo-slot {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          padding: 12px;
+          border-radius: 12px;
+          background: #0f172a;
+          border: 1px dashed rgba(167, 139, 250, 0.45);
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+        .recipe-photo-slot:hover {
+          border-color: #a78bfa;
+          background: #1e293b;
+        }
+        .recipe-photo-slot.has-photo {
+          border-style: solid;
+          border-color: #10b981;
+          background: rgba(16, 185, 129, 0.08);
+        }
+        .recipe-slot-icon {
+          width: 44px;
+          height: 44px;
+          border-radius: 10px;
+          background: rgba(124, 58, 237, 0.22);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 22px;
+          flex-shrink: 0;
+        }
+        .recipe-thumb {
+          width: 52px;
+          height: 52px;
+          object-fit: cover;
+          border-radius: 10px;
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          flex-shrink: 0;
+        }
+        .recipe-slot-info {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+        .substitutions-banner {
+          margin-top: 12px;
+          padding: 11px 14px;
+          border-radius: 12px;
+          background: rgba(124, 58, 237, 0.15);
+          border: 1px solid rgba(167, 139, 250, 0.4);
+        }
+        .sub-list {
+          margin: 4px 0 0;
+          padding-left: 18px;
+          font-size: 12.5px;
+          font-weight: 600;
+          color: #e2e8f0;
+        }
+        .sub-list li {
+          margin-bottom: 3px;
+        }
+
         .divider {
           border: none;
           border-top: 1px solid var(--mm-border);
@@ -3880,10 +4157,14 @@ class MealMindPanel extends HTMLElement {
         this._render();
       };
     });
+    const scanRecipeCardBtn = root.getElementById("scan-recipe-card-btn");
+    if (scanRecipeCardBtn) {
+      scanRecipeCardBtn.onclick = () => this._openMealModal(null, true);
+    }
     const newDbMealBtn = root.getElementById("new-db-meal-btn");
-    if (newDbMealBtn) newDbMealBtn.onclick = () => this._openMealModal(null);
+    if (newDbMealBtn) newDbMealBtn.onclick = () => this._openMealModal(null, false);
     const emptyNewDbBtn = root.getElementById("empty-new-db-meal-btn");
-    if (emptyNewDbBtn) emptyNewDbBtn.onclick = () => this._openMealModal(null);
+    if (emptyNewDbBtn) emptyNewDbBtn.onclick = () => this._openMealModal(null, false);
 
     root.querySelectorAll(".db-menu-toggle-btn").forEach((btn) => {
       btn.onclick = (e) => {
@@ -4310,6 +4591,26 @@ class MealMindPanel extends HTMLElement {
 
     // Modal 2: Meal Database Modal listeners
     if (this._mealModal) {
+      const toggleScannerBtn = root.getElementById("toggle-card-scanner-btn");
+      if (toggleScannerBtn) {
+        toggleScannerBtn.onclick = () => {
+          this._mealModal.showCardScanner = !this._mealModal.showCardScanner;
+          this._render();
+        };
+      }
+      const frontInp = root.getElementById("recipe-card-front-input");
+      if (frontInp) {
+        frontInp.onchange = (e) => this._handleRecipeCardPhotoSelect("front", e);
+      }
+      const backInp = root.getElementById("recipe-card-back-input");
+      if (backInp) {
+        backInp.onchange = (e) => this._handleRecipeCardPhotoSelect("back", e);
+      }
+      const runCardScanBtn = root.getElementById("run-recipe-card-scan-btn");
+      if (runCardScanBtn) {
+        runCardScanBtn.onclick = () => this._runRecipeCardScan();
+      }
+
       const nameInp = root.getElementById("meal-modal-name");
       if (nameInp) nameInp.oninput = () => (this._mealModal.name = nameInp.value);
 

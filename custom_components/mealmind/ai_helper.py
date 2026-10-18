@@ -123,31 +123,40 @@ async def _call_gemini_rest(
     prompt: str,
     image_base64: str | None = None,
     mime_type: str = "image/jpeg",
+    extra_images: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Call Google Gemini REST API directly with JSON output mode."""
+    """Call Google Gemini REST API directly with JSON output mode (supports single or multiple images)."""
     session = async_get_clientsession(hass)
 
-    parts: list[dict[str, Any]] = [{"text": prompt}]
-    if image_base64:
-        # Strip data URI prefix if present
-        if "," in image_base64 and image_base64.startswith("data:"):
-            header, image_base64 = image_base64.split(",", 1)
+    def _make_inline_part(b64_str: str, default_mime: str = "image/jpeg") -> dict[str, Any]:
+        actual_mime = default_mime or "image/jpeg"
+        raw_b64 = b64_str
+        if "," in raw_b64 and raw_b64.startswith("data:"):
+            header, raw_b64 = raw_b64.split(",", 1)
             if ":" in header and ";" in header:
-                mime_type = header.split(":", 1)[1].split(";", 1)[0]
-        parts.insert(
-            0,
-            {
-                "inline_data": {
-                    "mime_type": mime_type or "image/jpeg",
-                    "data": image_base64,
-                }
-            },
-        )
+                actual_mime = header.split(":", 1)[1].split(";", 1)[0]
+        return {
+            "inline_data": {
+                "mime_type": actual_mime,
+                "data": raw_b64,
+            }
+        }
 
+    parts: list[dict[str, Any]] = []
+    if image_base64:
+        parts.append(_make_inline_part(image_base64, mime_type))
+    if extra_images:
+        for img_item in extra_images:
+            b64_val = img_item.get("data") or img_item.get("image_base64")
+            if b64_val:
+                parts.append(_make_inline_part(b64_val, img_item.get("mime_type", "image/jpeg")))
+    parts.append({"text": prompt})
+
+    has_images = bool(image_base64 or extra_images)
     payload = {
         "contents": [{"parts": parts}],
         "generationConfig": {
-            "temperature": 0.2 if image_base64 else 0.7,
+            "temperature": 0.25 if has_images else 0.7,
             "responseMimeType": "application/json",
         },
     }
@@ -379,3 +388,76 @@ Return ONLY valid JSON with this exact structure:
         image_base64=image_base64,
         mime_type=mime_type,
     )
+
+
+async def async_scan_recipe_card(
+    hass: HomeAssistant,
+    front_image_base64: str | None,
+    back_image_base64: str | None,
+    settings: dict[str, Any],
+    front_mime_type: str = "image/jpeg",
+    back_mime_type: str = "image/jpeg",
+) -> dict[str, Any]:
+    """Scan front and/or back photos of a physical recipe card to extract Meal Name & Ingredients,
+    automatically substituting ingredients to match the household's dietary profile and dislikes."""
+    api_key = _get_gemini_api_key(hass, settings)
+    if not api_key:
+        raise RuntimeError(
+            "No Google Generative AI API key found. Ensure the Google Generative AI integration is configured."
+        )
+
+    extra_images: list[dict[str, str]] = []
+    if front_image_base64:
+        extra_images.append({"data": front_image_base64, "mime_type": front_mime_type or "image/jpeg"})
+    if back_image_base64:
+        extra_images.append({"data": back_image_base64, "mime_type": back_mime_type or "image/jpeg"})
+
+    if not extra_images:
+        raise ValueError("Please provide at least one photo (front or back) of the recipe card.")
+
+    dietary = settings.get("dietary_profile", "Vegetarian")
+    dislikes = settings.get("dislikes", ["feta", "beetroot"])
+    if isinstance(dislikes, list):
+        dislikes_str = ", ".join(dislikes)
+    else:
+        dislikes_str = str(dislikes)
+    custom_prefs = settings.get("custom_preferences", "")
+
+    prompt = f"""You are examining photo(s) of a physical recipe card (such as the front and/or back of a recipe card or cookbook page).
+Your task is to create a clean Saved Meal entry for the user's MealMind database containing ONLY the Meal Name, Shopping-List Ingredients, and Tags (do NOT retain cooking steps or method instructions).
+
+CRITICAL — DIETARY & DISLIKE ADAPTATION RULES:
+- User's Dietary Profile: {dietary}
+- User's Disliked / Excluded Ingredients (MUST NEVER BE USED): {dislikes_str}
+- Household Preferences: {custom_prefs}
+
+1. If the recipe card contains any meat, poultry, fish, seafood, or stock/ingredients that violate `{dietary}`, you MUST automatically substitute them with a delicious, culinary-appropriate `{dietary}` alternative (for example, replacing Chicken Breast with Veggie Chicken-Style Pieces or Halloumi/Tofu; Beef/Pork Mince with Veggie Mince or Lentils; Chicken Stock with Vegetable Stock; Prawns with King Oyster Mushrooms or Halloumi, etc.) and adjust the Meal Name if the original title named the meat/fish.
+2. If the recipe card contains any disliked ingredient from `{dislikes_str}` (for example, Feta or Beetroot), you MUST automatically substitute it with a complementary alternative that fits the dish (for example, replacing Feta with Halloumi, Cheddar, or Paneer).
+3. Format each ingredient as a clean, concise UK supermarket shopping list item name without gram weights or prep verbs (e.g., use "Red Onion" instead of "1 finely sliced red onion (120g)", use "Vegetable Stock Paste" instead of "1 sachet chicken stock"). Exclude basic tap water, salt, pepper, and cooking oil.
+4. Do NOT include recipe steps or cooking instructions.
+
+Return ONLY valid JSON matching this exact structure:
+{{
+  "name": "Final Meal Name (adapted for dietary profile/dislikes if needed)",
+  "original_name": "Original Recipe Title on the Card",
+  "ingredients": [
+    "Ingredient 1",
+    "Ingredient 2"
+  ],
+  "tags": [
+    "Tag1",
+    "Tag2"
+  ],
+  "substitutions_made": [
+    "Replaced [Original Ingredient] with [New Ingredient] ([Reason: e.g. Vegetarian / Dislike])"
+  ]
+}}
+"""
+
+    return await _call_gemini_rest(
+        hass,
+        api_key=api_key,
+        prompt=prompt,
+        extra_images=extra_images,
+    )
+

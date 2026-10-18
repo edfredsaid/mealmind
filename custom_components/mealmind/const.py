@@ -5,7 +5,7 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "mealmind"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 PLATFORMS: list[Platform] = [
     Platform.CALENDAR,
